@@ -1,0 +1,376 @@
+Analyze the application using ALL the data provided below and return ONLY one valid JSON object.
+
+Do NOT return markdown.
+Do NOT return ```json.
+Do NOT return explanations outside the JSON.
+The response MUST be directly parseable by JSON.parse().
+
+INPUT DATA
+
+Process Info:
+{context['process_info']}
+
+Working Directory:
+{context['working_directory']}
+
+Files Contents:
+{json.dumps(files, indent=2)}
+
+Command Outputs:
+{json.dumps(commands, indent=2)}
+
+OUTPUT SCHEMA
+
+Return exactly this structure:
+
+{
+"About_Application": "one-line description of the application",
+"Nodes": {
+"unique_node_id": {
+"label": "Human readable service/application name",
+"tech": "Technology or application name",
+"port": 3000,
+"host": "127.0.0.1",
+"group": "UI"
+}
+},
+"Connections": [
+{
+"from": "unique_node_id",
+"to": "unique_node_id",
+"protocol": "HTTP",
+"source": "127.0.0.1:3000",
+"target": "10.0.0.10:8010"
+}
+]
+}
+
+STRICT RULES FOR NODES
+
+1. "Nodes" MUST be a flat JSON object.
+
+2. Every application, service, database, authentication service, queue, cache, frontend, backend, API service, reverse proxy, or other independently identifiable component MUST have its own node.
+
+3. NEVER create generic nodes such as:
+   "backend"
+   "database"
+   "service"
+   "api"
+   
+   if the actual application/service name can be determined.
+
+4. Use a short, stable, unique node ID.
+   
+   Examples:
+   "frontend"
+   "alpha"
+   "gamma"
+   "sigma"
+   "rev_engg"
+   "agent"
+   "modelsphere"
+   "common_service"
+   "keycloak"
+   "postgres"
+
+5. The node ID MUST be used exactly in the "from" and "to" fields of Connections.
+
+6. "label" must contain the human-readable application/service name.
+
+7. "tech" must contain the detected technology/application.
+   
+   Examples:
+   "Next.js 15.4.4"
+   "React 19"
+   "FastAPI"
+   "Flask"
+   "PostgreSQL"
+   "MongoDB"
+   "Keycloak"
+   "Redis"
+   "Nginx"
+
+8. "port" MUST be a JSON number when a port is known.
+   
+   Example:
+   3000
+
+9. If the port is unknown, use:
+   
+   "port": null
+
+10. "host" MUST contain the actual IP address or hostname associated with the node when it can be determined.
+
+11. If the host/IP is unknown, use:
+
+"host": "127.0.0.1"
+
+12. "group" MUST be one of:
+
+"UI"
+"API"
+"DATABASE"
+"AUTH"
+"CACHE"
+"QUEUE"
+"STORAGE"
+"PROXY"
+"SERVICE"
+"OTHER"
+
+13. Choose the group based on the actual role of the component.
+
+14. Do NOT create a node only because a word appears in a configuration file.
+
+15. A node must represent an actual application/service/component that is directly supported by the supplied evidence.
+
+16. Do NOT invent applications, ports, hosts, technologies, or services.
+
+17. If multiple processes belong to the same application, represent them as one application node unless the data clearly shows they are separate communicating services.
+
+18. If two services have the same name but run on different hosts or ports and are clearly separate instances, give them unique IDs.
+
+STRICT RULES FOR CONNECTIONS
+
+1. "Connections" MUST ALWAYS be a JSON array.
+
+2. NEVER return Connections as a string.
+
+3. Every connection MUST have:
+   
+   "from"
+   "to"
+   "protocol"
+   "source"
+   "target"
+
+4. "from" MUST contain the exact node ID of the source node.
+
+5. "to" MUST contain the exact node ID of the destination node.
+
+6. "from" and "to" MUST match keys that exist inside "Nodes".
+
+7. NEVER use a display name in "from" or "to" if the node ID is different.
+
+8. "protocol" should contain the observed communication protocol.
+   
+   Examples:
+   "HTTP"
+   "HTTPS"
+   "TCP"
+   "UDP"
+   "gRPC"
+   "JDBC"
+   "MongoDB"
+   "Redis"
+
+9. "source" MUST contain the observed source IP/hostname and port.
+   
+   Example:
+   "127.0.0.1:3000"
+
+10. "target" MUST contain the observed destination IP/hostname and port.
+
+Example:
+"10.20.30.40:8010"
+
+11. Only create a connection when communication between the two components is directly supported by the supplied data.
+
+12. Do NOT infer a connection merely because two applications logically might communicate.
+
+13. Do NOT create connections based only on application architecture assumptions.
+
+14. If a connection is mentioned in an LLM-generated recommendation but there is NO supporting evidence in Process Info, Working Directory, Files Contents, or Command Outputs, DO NOT create that connection.
+
+15. If the same connection appears multiple times, return it only once.
+
+16. Do NOT create self-connections.
+
+17. Preserve the actual direction of communication.
+
+Example:
+
+frontend -> alpha
+
+means the frontend calls alpha.
+
+18. If the data says:
+
+frontend alpha via HTTP on 127.0.0.1:3000 10.0.0.10:8010
+
+return:
+
+{
+"from": "frontend",
+"to": "alpha",
+"protocol": "HTTP",
+"source": "127.0.0.1:3000",
+"target": "10.0.0.10:8010"
+}
+
+IMPORTANT EVIDENCE RULE
+
+The application mapping must represent OBSERVED architecture, not a guessed architecture.
+
+Use evidence in this priority order:
+
+1. Active listening ports and process information
+2. Network/socket information
+3. Application configuration files
+4. Environment variables
+5. Source code API calls
+6. Dependency/configuration information
+7. Command outputs
+8. Other supplied application evidence
+
+Only use LLM reasoning to identify the application/service represented by the evidence.
+
+Do NOT invent network connections.
+
+SPECIAL RULE FOR LISTENING PROCESSES
+
+If process information shows something like:
+
+"Local": "0.0.0.0:8013"
+"State": "LISTEN"
+"Peer": "("next-server",pid=5789,fd=21)"
+
+and the process/application is identified as a Next.js frontend, create a node such as:
+
+"frontend": {
+"label": "frontend",
+"tech": "Next.js",
+"port": 8013,
+"host": "0.0.0.0",
+"group": "UI"
+}
+
+Do NOT create a connection from the process to itself merely because it is listening.
+
+A LISTEN socket means the application is accepting connections; it does not by itself prove which remote application connects to it.
+
+SPECIAL RULE FOR API CALLS
+
+If source code or configuration clearly shows:
+
+HTTP request:
+frontend -> alpha
+
+then create:
+
+{
+"from": "frontend",
+"to": "alpha",
+"protocol": "HTTP",
+"source": "<actual source host:port>",
+"target": "<actual target host:port>"
+}
+
+If only the target host/port is known, preserve that information and use the known source information.
+
+Do NOT fabricate missing addresses.
+
+SPECIAL RULE FOR DATABASE CONNECTIONS
+
+If application configuration clearly shows:
+
+DATABASE_URL=postgresql://10.0.0.20:5432/appdb
+
+and the application is identified as "alpha", create:
+
+"postgres": {
+"label": "PostgreSQL",
+"tech": "PostgreSQL",
+"port": 5432,
+"host": "10.0.0.20",
+"group": "DATABASE"
+}
+
+and:
+
+{
+"from": "alpha",
+"to": "postgres",
+"protocol": "PostgreSQL",
+"source": "<known alpha address>",
+"target": "10.0.0.20:5432"
+}
+
+Only do this when the database connection is actually present in the supplied evidence.
+
+SPECIAL RULE FOR UNKNOWN VALUES
+
+If technology is unknown:
+
+"tech": "Unknown"
+
+If port is unknown:
+
+"port": null
+
+If host is unknown:
+
+"host": "127.0.0.1"
+
+If protocol is unknown:
+
+"protocol": "TCP"
+
+IMPORTANT NODE/CONNECTION CONSISTENCY CHECK
+
+Before returning the final JSON:
+
+1. Every connection "from" MUST exist in "Nodes".
+2. Every connection "to" MUST exist in "Nodes".
+3. Every node ID MUST be unique.
+4. No duplicate connections.
+5. No self-connections.
+6. "Connections" MUST be an array.
+7. "Nodes" MUST be an object.
+8. The JSON MUST be valid.
+9. There MUST be no trailing commas.
+10. Return ONLY the JSON object.
+
+FINAL REQUIRED FORMAT
+
+{
+"About_Application": "one-line application description",
+"Nodes": {
+"frontend": {
+"label": "Frontend",
+"tech": "Next.js",
+"port": 3000,
+"host": "127.0.0.1",
+"group": "UI"
+},
+"alpha": {
+"label": "Alpha",
+"tech": "FastAPI",
+"port": 8010,
+"host": "10.0.0.10",
+"group": "API"
+},
+"postgres": {
+"label": "PostgreSQL",
+"tech": "PostgreSQL",
+"port": 5432,
+"host": "10.0.0.20",
+"group": "DATABASE"
+}
+},
+"Connections": [
+{
+"from": "frontend",
+"to": "alpha",
+"protocol": "HTTP",
+"source": "127.0.0.1:3000",
+"target": "10.0.0.10:8010"
+},
+{
+"from": "alpha",
+"to": "postgres",
+"protocol": "PostgreSQL",
+"source": "10.0.0.10:8010",
+"target": "10.0.0.20:5432"
+}
+]

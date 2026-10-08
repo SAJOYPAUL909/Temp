@@ -767,7 +767,7 @@ def extract_port(
         r":(\d+)\s+.*LISTEN",
         r"127\.0\.0\.1:(\d+)",
         r"0\.0\.0\.0:(\d+)",
-        r":::(\d+)",
+        r"\[::\]:(\d+)",
         r"\*:(\d+)"
     ]
 
@@ -1027,4 +1027,4 @@ def create_source_tar(
     if exit_code != 0:
 
         raise RuntimeError(
-       
+     

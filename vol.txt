@@ -1,0 +1,207 @@
+def create_and_send_volume_tars(
+    ssh1,
+    sudo_password1,
+    ssh2,
+    sudo_password2,
+    container_name,
+    mounts,
+    temp_dir1,
+    temp_dir2
+):
+    """
+    Transfer bind mount data from VM1 to a fixed writable volume
+    location on VM2.
+
+    Destination:
+        /opt/tech-modernizer/volumes/<container_name>/<mount_name>
+    """
+
+    container_volume_root = (
+        f"{DESTINATION_VOLUME_ROOT}/{container_name}"
+    )
+
+    # Create the container's volume root
+    exit_code, out, err = run_remote_command(
+        ssh2,
+        f"mkdir -p '{container_volume_root}'",
+        use_sudo=True,
+        sudo_password=sudo_password2
+    )
+
+    if exit_code != 0:
+        raise Exception(
+            f"Could not create destination volume root "
+            f"{container_volume_root}: {err}"
+        )
+
+    for index, m in enumerate(mounts):
+
+        mtype = m.get("Type")
+        source = m.get("Source")
+        destination = m.get("Destination")
+
+        print("\n" + "=" * 70)
+        print(f"Processing Mount #{index + 1}")
+        print(f"  Type        : {mtype}")
+        print(f"  Source      : {source}")
+        print(f"  Destination : {destination}")
+        print("=" * 70)
+
+        if not source:
+            print("Skipping mount: no source")
+            continue
+
+        if should_skip_path(source):
+            print(f"Skipping excluded path: {source}")
+            continue
+
+        if mtype != "bind":
+            print(f"Skipping non-bind mount: {mtype}")
+            continue
+
+        # ---------------------------------------------------------
+        # Create a safe directory name for the destination
+        # ---------------------------------------------------------
+
+        mount_name = os.path.basename(source.rstrip("/"))
+
+        if not mount_name:
+            mount_name = f"mount_{index + 1}"
+
+        destination_volume = (
+            f"{container_volume_root}/{mount_name}"
+        )
+
+        print(f"Destination volume: {destination_volume}")
+
+        # ---------------------------------------------------------
+        # Create destination directory
+        # ---------------------------------------------------------
+
+        exit_code, out, err = run_remote_command(
+            ssh2,
+            f"mkdir -p '{destination_volume}'",
+            use_sudo=True,
+            sudo_password=sudo_password2
+        )
+
+        if exit_code != 0:
+            print(
+                f"Could not create destination directory: {err}"
+            )
+            continue
+
+        # ---------------------------------------------------------
+        # Create tar on VM1
+        # ---------------------------------------------------------
+
+        tar_name = (
+            f"{container_name}_"
+            f"{mount_name}_"
+            f"bind.tar"
+        )
+
+        tar_path1 = os.path.join(
+            temp_dir1,
+            tar_name
+        )
+
+        tar_path2 = os.path.join(
+            temp_dir2,
+            tar_name
+        )
+
+        parent_dir = os.path.dirname(source)
+        source_name = os.path.basename(source.rstrip("/"))
+
+        print(
+            f"Creating tar on VM1:\n"
+            f"  Source : {source}\n"
+            f"  Tar    : {tar_path1}"
+        )
+
+        exit_code, out, err = run_remote_command(
+            ssh1,
+            (
+                f"tar -cvf '{tar_path1}' "
+                f"-C '{parent_dir}' "
+                f"'{source_name}'"
+            ),
+            use_sudo=True,
+            sudo_password=sudo_password1
+        )
+
+        if exit_code != 0:
+            print(f"Error creating tar: {err}")
+            continue
+
+        # ---------------------------------------------------------
+        # Transfer tar VM1 -> VM2
+        # ---------------------------------------------------------
+
+        print(
+            f"Transferring:\n"
+            f"  {tar_path1}\n"
+            f"  -> {tar_path2}"
+        )
+
+        if not stream_file_via_sftp(
+            ssh1,
+            tar_path1,
+            ssh2,
+            tar_path2
+        ):
+            print("Error transferring tar")
+            continue
+
+        # ---------------------------------------------------------
+        # Extract into destination volume
+        # ---------------------------------------------------------
+
+        print(
+            f"Extracting mount into {destination_volume}"
+        )
+
+        exit_code, out, err = run_remote_command(
+            ssh2,
+            (
+                f"tar -xf '{tar_path2}' "
+                f"-C '{destination_volume}' "
+                f"--strip-components=1"
+            ),
+            use_sudo=True,
+            sudo_password=sudo_password2
+        )
+
+        if exit_code != 0:
+            print(f"Error extracting tar: {err}")
+            continue
+
+        # ---------------------------------------------------------
+        # Fix ownership/permissions
+        # ---------------------------------------------------------
+
+        print(
+            f"Setting permissions for {destination_volume}"
+        )
+
+        exit_code, out, err = run_remote_command(
+            ssh2,
+            (
+                f"chmod -R 755 "
+                f"'{destination_volume}'"
+            ),
+            use_sudo=True,
+            sudo_password=sudo_password2
+        )
+
+        if exit_code != 0:
+            print(
+                f"Warning: Could not update permissions: {err}"
+            )
+
+        print(
+            f"Mount transferred successfully:\n"
+            f"  {source}\n"
+            f"  -> {destination_volume}"
+        )

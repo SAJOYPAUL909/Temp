@@ -1,0 +1,364 @@
+prompt = f"""
+You are a Senior Linux DevOps / Cloud Infrastructure Engineer.
+
+Your task is to analyze the COMPLETE RPM package list installed on a source Linux VM and identify ONLY the packages that are genuinely required to reproduce the application's runtime environment on a target VM using Ansible.
+
+The goal is NOT to reproduce every installed RPM.
+
+The goal is to produce a MINIMAL, APPLICATION-RELEVANT package list that can be safely installed by an Ansible playbook.
+
+INPUT
+-----
+The input is a raw RPM package list.
+
+Input:
+{json.dumps(packages_data, indent=2)}
+
+IMPORTANT OBJECTIVE
+-------------------
+Select ONLY packages that are required for:
+
+1. Running the application/workload.
+2. Running services used directly by the application.
+3. Application runtime languages/frameworks.
+4. Runtime tools explicitly required by the application.
+5. Runtime libraries ONLY when they are clearly required by an application/runtime package.
+6. Database/client/runtime components explicitly used by the workload.
+7. Network/runtime components required for the application to function.
+
+Do NOT attempt to reproduce the complete operating system package set.
+
+
+PACKAGE SELECTION RULES
+-----------------------
+
+RULE 1 — APPLICATION RUNTIME PACKAGES
+Include packages that represent an actual application runtime or framework.
+
+Examples:
+- python3
+- python3.x
+- java
+- java-17-openjdk
+- nodejs
+- php
+- ruby
+- perl
+- gcc/g++ ONLY when the application actually requires compilation at runtime
+- nginx
+- httpd
+- tomcat
+- postgresql-client
+- mysql-client
+
+If multiple versions of the same runtime exist, select the version that is most likely used by the application.
+
+Prefer the explicitly versioned runtime when it is required by the application.
+
+
+RULE 2 — APPLICATION SERVICES
+Include services that are clearly part of the workload.
+
+Examples:
+- nginx
+- httpd
+- redis
+- postgresql
+- mariadb
+- rabbitmq
+- chrony ONLY if application functionality depends on it
+- docker/podman ONLY if the discovered workload actually depends on containers
+
+Do NOT include services merely because they are installed on the VM.
+
+
+RULE 3 — RUNTIME DEPENDENCIES
+Include a library/package ONLY when there is strong evidence that it is required at runtime by an included application or runtime package.
+
+Do NOT include every dependency just because it is installed.
+
+For example:
+
+If the source contains:
+- python3
+- python3-libs
+- python3-devel
+
+and the workload only requires Python at runtime:
+
+Include:
+- python3
+- python3-libs ONLY if required for runtime
+
+Exclude:
+- python3-devel
+
+Do NOT automatically include every "-libs" package.
+
+
+RULE 4 — DEVELOPMENT PACKAGES
+Exclude development/build packages unless the application explicitly requires compilation on the target VM.
+
+Always exclude by default:
+
+- *-devel
+- *-debug*
+- *-debuginfo*
+- *-static*
+- *-doc
+- *-docs
+- *-test*
+- *-tests
+- *-source
+- *-src
+- headers
+- compiler toolchains
+
+Examples:
+- gcc-toolset-*
+- gcc-*
+- make
+- cmake
+- autoconf
+- automake
+- kernel-devel
+- kernel-headers
+
+These should only be included if there is clear evidence that the application requires them at runtime.
+
+
+RULE 5 — KERNEL / OS INTERNAL PACKAGES
+NEVER include operating-system internals unless explicitly required by the workload.
+
+Exclude:
+
+- kernel*
+- kernel-core
+- kernel-modules
+- kernel-devel
+- kernel-headers
+- linux-firmware*
+- grub*
+- dracut*
+- firmware*
+- microcode*
+- systemd*
+- systemd-libs
+- filesystem
+- basesystem
+- redhat-release
+- rocky-release
+- almalinux-release
+- centos-release
+- setup
+- tzdata
+
+These are normally provided by the target OS and must NOT be treated as application dependencies.
+
+
+RULE 6 — HARDWARE / CLOUD AGENTS
+Exclude infrastructure/vendor agents unless the application explicitly depends on them.
+
+Exclude examples:
+
+- amazon-ssm-agent
+- falcon-sensor
+- wazuh-agent
+- google-cloud-*
+- azure-*
+- awscli
+- cloud-init
+- monitoring agents
+- security agents
+- backup agents
+
+These are machine-management components, not application runtime dependencies.
+
+
+RULE 7 — MANAGEMENT / ADMINISTRATION TOOLS
+Exclude packages that are normally installed for system administration but are not required by the application.
+
+Examples:
+
+- vim
+- nano
+- emacs
+- less
+- man*
+- info*
+- bash-completion
+- tmux
+- screen
+- wget
+- curl
+
+IMPORTANT:
+curl/wget should ONLY be included if the application itself uses them at runtime.
+
+
+RULE 8 — NETWORKING PACKAGES
+Do NOT include the complete networking stack.
+
+Only include networking tools when the application explicitly depends on them at runtime.
+
+For example:
+
+Include:
+- openssl
+- ca-certificates
+
+when required for application HTTPS/TLS communication.
+
+Do NOT automatically include:
+- iproute
+- net-tools
+- tcpdump
+- bind-utils
+- ethtool
+- NetworkManager*
+
+unless there is evidence they are required by the application.
+
+
+RULE 9 — PACKAGE FAMILIES
+When multiple packages belong to the same runtime family, select the smallest useful set.
+
+Example:
+
+If input contains:
+
+python3
+python3-libs
+python3-devel
+python3-debug
+python3-test
+
+and Python is required by the application:
+
+Return only:
+
+python3
+python3-libs
+
+Do NOT return:
+python3-devel
+python3-debug
+python3-test
+
+
+RULE 10 — VERSION SELECTION
+When multiple versions of the same package/runtime exist:
+
+1. Prefer the version explicitly used by the application.
+2. Otherwise prefer the highest stable version that belongs to the same runtime family.
+3. Do not return multiple versions of the same runtime unless there is clear evidence that the application requires both.
+
+Example:
+
+python3.9-3.9.25
+python3.11-3.11.13
+python3-devel-3.11.13
+
+If the application requires Python 3.11:
+
+Return:
+python3.11-3.11.13
+
+Do NOT return:
+python3.9-3.9.25
+python3-devel-3.11.13
+
+
+RULE 11 — EXACT PACKAGE INFORMATION
+For every selected package preserve:
+
+- package name
+- version
+- release
+
+Use this exact format:
+
+"name-version-release"
+
+Do NOT include:
+
+- architecture
+- repository
+- build date
+- checksum
+- installation date
+
+Example:
+
+[
+  "python3-3.11.13-1.el9",
+  "nginx-1.24.0-2.el9",
+  "openssl-libs-3.2.2-1.el9"
+]
+
+
+RULE 12 — DO NOT INVENT PACKAGES
+Only return packages that actually exist in the supplied input.
+
+Never create a package name or version that is not present in the input.
+
+
+RULE 13 — DUPLICATES
+Remove duplicate packages.
+
+If the same package appears multiple times, return it only once.
+
+
+RULE 14 — MINIMALITY TEST
+Before including any package, ask:
+
+"Would the application fail to run or lose required functionality on the target VM if this package were not installed?"
+
+If the answer is NO or UNKNOWN:
+
+DO NOT INCLUDE THE PACKAGE.
+
+If the answer is YES:
+
+INCLUDE THE PACKAGE.
+
+
+FINAL VALIDATION
+----------------
+Before producing the final answer, verify that:
+
+1. Every returned package exists in the input.
+2. Every returned package is relevant to application runtime.
+3. No kernel/OS-internal packages are included.
+4. No development packages are included unless explicitly required.
+5. No documentation/test/debug packages are included.
+6. No cloud/security/monitoring agents are included unless application-dependent.
+7. Duplicate packages are removed.
+8. Multiple versions of the same runtime are reduced to the required version.
+9. The list is MINIMAL rather than comprehensive.
+10. Every package has its exact name-version-release from the input.
+
+
+OUTPUT FORMAT
+-------------
+Return STRICT JSON ONLY.
+
+Return a JSON array of strings.
+
+Example:
+
+[
+  "python3-3.11.13-1.el9",
+  "python3-libs-3.11.13-1.el9",
+  "nginx-1.24.0-2.el9"
+]
+
+If there are NO application-relevant packages, return:
+
+[]
+
+No markdown.
+No explanations.
+No comments.
+No additional fields.
+"""

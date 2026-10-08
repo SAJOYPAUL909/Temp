@@ -1,14 +1,25 @@
-import os
-import re
-import json
-import time
-import uuid
-import base64
-import shlex
-import requests
+from flask import Blueprint, request, jsonify
 import paramiko
+import os
+import json
+import re
+import shutil
+import requests
+import base64
+import time
 
 from db import load_config
+from migrate_non_container import (
+    run_remote_command,
+    create_remote_temp_dir,
+    cleanup_remote_dir
+)
+
+
+bp = Blueprint(
+    "non_container_to_container_migrate",
+    __name__
+)
 
 
 # ============================================================
@@ -16,1346 +27,1335 @@ from db import load_config
 # ============================================================
 
 MAX_CONTAINERIZATION_ATTEMPTS = 5
+BUILD_TIMEOUT = 900
+RUN_TIMEOUT = 120
 CONTAINER_START_WAIT = 8
-LLM_TIMEOUT = 1200
-
-ENVIRONMENT = os.environ.get("environment") or "local"
 
 
 # ============================================================
-# COMMON HELPERS
+# LLM - CONTAINERFILE GENERATION / REPAIR
 # ============================================================
 
-def print_step(title):
-    print("\n" + "=" * 80)
-    print(title)
-    print("=" * 80)
-
-
-def safe_str(value):
-    if value is None:
-        return ""
-    return str(value)
-
-
-def ssh_exec(ssh, command, timeout=120):
+def call_llm_for_containerfile(context, previous_attempt=None):
     """
-    Execute a command over SSH.
-    Returns:
-        stdout, stderr, exit_code
-    """
-    print(f"\n[REMOTE COMMAND]\n{command}")
-
-    stdin, stdout, stderr = ssh.exec_command(command, timeout=timeout)
-
-    out = stdout.read().decode("utf-8", errors="ignore")
-    err = stderr.read().decode("utf-8", errors="ignore")
-
-    exit_code = stdout.channel.recv_exit_status()
-
-    print(f"[EXIT CODE] {exit_code}")
-
-    if out:
-        print(f"[STDOUT]\n{out}")
-
-    if err:
-        print(f"[STDERR]\n{err}")
-
-    return out, err, exit_code
-
-
-def connect_ssh(host, username, password, port=22):
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    ssh.connect(
-        hostname=host,
-        username=username,
-        password=password,
-        port=int(port),
-        timeout=30,
-        banner_timeout=30,
-        auth_timeout=30
-    )
-
-    return ssh
-
-
-def connect_ssh_from_config(config, prefix):
-    """
-    Supports keys such as:
-
-        SourceIP
-        SourceUsername
-        SourcePassword
-        SourcePort
-
-    or
-
-        TargetIP
-        TargetUsername
-        TargetPassword
-        TargetPort
+    Generate the initial Containerfile or repair the previous
+    Containerfile based on build/runtime failure evidence.
     """
 
-    ip = (
-        config.get(f"{prefix}IP")
-        or config.get(f"{prefix}_IP")
-        or config.get(prefix.lower() + "_ip")
+    api_key = os.environ.get("api_key")
+
+    cfg = load_config(
+        os.environ.get("environment") or "local"
     )
 
-    username = (
-        config.get(f"{prefix}Username")
-        or config.get(f"{prefix}_Username")
-        or config.get(prefix.lower() + "_username")
-    )
+    model_name = cfg.get("model_name", {})
+    model_url = cfg.get("model_url", {})
 
-    password = (
-        config.get(f"{prefix}Password")
-        or config.get(f"{prefix}_Password")
-        or config.get(prefix.lower() + "_password")
-    )
+    previous_attempt = previous_attempt or {}
 
-    port = (
-        config.get(f"{prefix}Port")
-        or config.get(f"{prefix}_Port")
-        or config.get(prefix.lower() + "_port")
-        or 22
-    )
+    prompt = f"""
+You are an expert DevOps engineer specializing in:
 
-    if not ip or not username:
-        raise ValueError(
-            f"Missing {prefix} connection information"
-        )
+- Docker
+- Podman
+- Linux application troubleshooting
+- Application containerization
+- Python
+- Node.js
+- Java
+- Frontend applications
+- Backend applications
+- Production container deployment
+- Automated Containerfile repair
 
-    return connect_ssh(
-        ip,
-        username,
-        password,
-        port
-    )
+Your task is to generate a COMPLETE and RUNNABLE Containerfile for
+the non-containerized application described below.
 
+============================================================
+APPLICATION INFORMATION
+============================================================
 
-# ============================================================
-# LLM CONFIGURATION
-# ============================================================
+PID:
+{context.get("pid")}
 
-def get_llm_config():
-    config = load_config(ENVIRONMENT)
+Working Directory:
+{context.get("working_directory")}
 
-    model_name = (
-        config.get("model_name")
-        or config.get("model")
-        or os.environ.get("MODEL_NAME")
-    )
+Process Information:
+{context.get("process_info")}
 
-    model_url = (
-        config.get("model_url")
-        or config.get("url")
-        or os.environ.get("MODEL_URL")
-    )
+Detected Listening Port:
+{context.get("port")}
 
-    api_key = (
-        config.get("api_key")
-        or config.get("API_KEY")
-        or os.environ.get("API_KEY")
-    )
+Port Command Output:
+{context.get("port_info")}
 
-    if not model_url:
-        raise ValueError("LLM model_url is not configured")
+Technology Stack:
+{context.get("tech_stack")}
 
-    return {
-        "model_name": model_name,
-        "model_url": model_url,
-        "api_key": api_key
-    }
+Files Present:
+{json.dumps(context.get("files", []), indent=2)}
 
+============================================================
+PREVIOUS ATTEMPT INFORMATION
+============================================================
 
-def call_llm(prompt):
-    """
-    Calls the configured LLM and returns raw text.
-    """
+Attempt Number:
+{previous_attempt.get("attempt", 0)}
 
-    llm = get_llm_config()
+Previous Containerfile:
+{previous_attempt.get("containerfile", "NONE")}
 
-    headers = {
-        "Content-Type": "application/json"
-    }
+Build Logs:
+{previous_attempt.get("build_logs", "NONE")}
 
-    if llm["api_key"]:
-        headers["x-api-key"] = llm["api_key"]
+Container Logs:
+{previous_attempt.get("container_logs", "NONE")}
+
+Container Inspect:
+{previous_attempt.get("container_inspect", "NONE")}
+
+Image Information:
+{previous_attempt.get("image_info", "NONE")}
+
+Failure Reason:
+{previous_attempt.get("failure_reason", "NONE")}
+
+============================================================
+PRIMARY OBJECTIVE
+============================================================
+
+The Containerfile must achieve ALL of the following:
+
+1. Build successfully.
+2. Create the required image.
+3. Start the application successfully.
+4. Keep the container running.
+5. Start the actual application process as the main
+   container process.
+6. Use the correct application startup command.
+7. Use the correct technology/runtime.
+8. Use the correct application port.
+9. Make server applications listen on 0.0.0.0 whenever applicable.
+10. Do not depend on files or paths from the source VM.
+11. Work with both Docker and Podman.
+
+============================================================
+RETRY / FAILURE REPAIR
+============================================================
+
+If this is the FIRST attempt:
+
+Generate the best Containerfile from the application evidence.
+
+If this is a RETRY:
+
+DO NOT blindly generate a new Containerfile.
+
+First analyze:
+
+1. Previous Containerfile
+2. Build logs
+3. Container logs
+4. Container inspect output
+5. Image information
+6. Application process information
+7. Port information
+
+Determine the ROOT CAUSE of the failure.
+
+Possible causes include:
+
+- incorrect base image
+- incompatible runtime version
+- missing OS package
+- missing application dependency
+- incorrect dependency installation
+- npm dependency failure
+- Python dependency failure
+- incorrect WORKDIR
+- incorrect COPY path
+- incorrect startup command
+- incorrect CMD
+- incorrect ENTRYPOINT
+- incorrect executable path
+- application starts and immediately exits
+- application binds only to localhost
+- incorrect port
+- missing environment variable
+- missing configuration
+- permissions
+- incorrect user
+- Python virtual environment copied incorrectly
+- Node modules copied incorrectly
+- native dependency problem
+- Java runtime problem
+- frontend production server problem
+- backend startup problem
+- application-specific runtime failure
+
+After identifying the root cause:
+
+1. Preserve everything that is already correct.
+2. Modify only what is required to fix the failure.
+3. Generate a corrected Containerfile.
+4. Do not make random changes.
+5. Do not downgrade working dependencies unless the logs prove
+   that a compatibility issue exists.
+
+============================================================
+GENERAL CONTAINERFILE RULES
+============================================================
+
+1. OUTPUT ONLY THE RAW CONTAINERFILE.
+
+2. Do NOT output:
+   - Markdown
+   - explanations
+   - comments outside the Containerfile
+   - ```dockerfile
+   - ```
+
+3. The output must be directly usable as a Dockerfile or
+   Containerfile.
+
+4. Select a base image compatible with the detected technology.
+
+5. Use stable, explicitly versioned base images.
+
+6. Prefer minimal images where compatibility allows it.
+
+7. Do NOT blindly use Alpine.
+
+8. Use Docker layer caching correctly.
+
+9. Copy dependency/manifest files before application source
+   whenever possible.
+
+10. Install only dependencies required to run the application.
+
+11. Do NOT copy:
+
+    .git
+    .env
+    node_modules
+    venv
+    .venv
+    __pycache__
+    logs
+    temporary files
+
+12. Do not copy an existing host virtual environment.
+
+13. Do not copy host node_modules.
+
+14. Set an explicit WORKDIR.
+
+15. Use explicit COPY instructions.
+
+16. Use an explicit CMD or ENTRYPOINT.
+
+17. The application must run in the foreground.
+
+18. NEVER use commands such as:
+
+    tail -f /dev/null
+    sleep infinity
+    while true; do sleep ...
+
+   merely to keep the container alive.
+
+19. The actual application process must keep the container alive.
+
+20. Use a non-root user whenever technically possible.
+
+21. Do not embed passwords, API keys, tokens or other secrets.
+
+22. Do not copy .env into the image.
+
+23. Environment variables required by the application should be
+    supplied at runtime.
+
+24. Do not use host networking.
+
+25. Do not use privileged mode.
+
+26. Do not use host filesystem paths.
+
+27. Do not invent application ports.
+
+28. If a listening port is available from the evidence, use it.
+
+29. If a port cannot be confidently identified, use the application
+    configuration/evidence to determine it. Do not randomly select
+    a port.
+
+30. EXPOSE the actual application port when applicable.
+
+============================================================
+PYTHON APPLICATION RULES
+============================================================
+
+If the application is Python:
+
+1. Select a compatible Python version.
+
+2. Use requirements.txt when present.
+
+3. If requirements.txt exists, install it.
+
+4. Do not copy the source machine's virtual environment.
+
+5. Use:
+
+       python -m pip
+
+   where appropriate.
+
+6. Determine the correct startup command from the application.
+
+7. If the application is Flask/FastAPI/Django/etc., determine the
+   actual application module and object from the available evidence.
+
+8. Make web applications listen on:
+
+       0.0.0.0
+
+9. Do not assume app.py, main.py, or another filename unless the
+   evidence supports it.
+
+============================================================
+NODE.JS APPLICATION RULES
+============================================================
+
+If the application is Node.js:
+
+1. Select a Node version compatible with package.json.
+
+2. If package-lock.json exists, prefer:
+
+       npm ci
+
+3. If npm ci fails because of legacy peer dependencies, use:
+
+       npm ci --legacy-peer-deps
+
+4. If package-lock.json does not exist, use:
+
+       npm install --legacy-peer-deps
+
+5. Do not blindly use npm install when package-lock.json exists.
+
+6. Do not copy node_modules.
+
+7. Inspect package.json scripts to determine the correct startup
+   command.
+
+8. Do not invent npm scripts.
+
+9. For production applications, avoid unnecessary development
+   dependencies when possible.
+
+============================================================
+JAVA APPLICATION RULES
+============================================================
+
+If the application is Java:
+
+1. Determine the Java version from the available evidence.
+
+2. Use a compatible JDK/JRE.
+
+3. Determine whether the application is:
+
+   - JAR
+   - WAR
+   - Spring Boot
+   - Tomcat
+   - another Java application
+
+4. Use the actual application artifact.
+
+5. Use the correct startup command.
+
+6. Do not invent JAR filenames.
+
+============================================================
+FRONTEND APPLICATION RULES
+============================================================
+
+If the application is a frontend:
+
+1. Determine whether it is:
+
+   - Vite
+   - React
+   - Next.js
+   - Angular
+   - Vue
+   - another framework
+
+2. Determine the correct build command.
+
+3. Determine the correct production startup mechanism.
+
+4. Do not assume npm run dev is suitable for production.
+
+5. If a production server is required, make sure it binds to
+   0.0.0.0.
+
+============================================================
+SECURITY RULES
+============================================================
+
+- Never embed secrets.
+- Never embed passwords.
+- Never embed API keys.
+- Never copy .env.
+- Avoid running as root.
+- Do not use privileged mode.
+- Do not use host networking.
+- Do not depend on the host filesystem.
+- Do not use arbitrary infinite loops.
+- Do not weaken security merely to make the application run.
+
+============================================================
+SUCCESS CONDITION
+============================================================
+
+The objective is NOT simply to produce a valid image.
+
+The objective is:
+
+    Containerfile builds successfully
+             AND
+    Image is created
+             AND
+    Container is created
+             AND
+    Container is running
+             AND
+    Application process is running
+             AND
+    Application listens on the expected port
+
+Return ONLY the final Containerfile.
+"""
 
     payload = {
-        "model": llm["model_name"],
+        "model": model_name,
         "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert DevOps engineer specializing "
+                    "in Docker, Podman, Linux application "
+                    "troubleshooting and automated Containerfile repair."
+                )
+            },
             {
                 "role": "user",
                 "content": prompt
             }
-        ],
-        "temperature": 0
+        ]
     }
 
-    last_error = None
+    headers = {
+        "x-api-key": api_key,
+        "Content-Type": "application/json"
+    }
 
-    for attempt in range(1, 3):
-        try:
-            print_step(f"LLM CALL - ATTEMPT {attempt}")
+    try:
+        response = requests.post(
+            model_url,
+            json=payload,
+            headers=headers,
+            timeout=600
+        )
 
-            response = requests.post(
-                llm["model_url"],
-                headers=headers,
-                json=payload,
-                timeout=LLM_TIMEOUT
+        if response.status_code != 200:
+            print(
+                "LLM Containerfile generation failed:",
+                response.status_code,
+                response.text
             )
 
-            response.raise_for_status()
-
-            data = response.json()
-
-            # OpenAI-compatible response
-            if "choices" in data:
-                content = data["choices"][0]["message"]["content"]
-
-            # Some internal APIs may return output/content directly
-            elif "content" in data:
-                content = data["content"]
-
-            elif "response" in data:
-                content = data["response"]
-
-            else:
-                content = str(data)
-
-            return safe_str(content).strip()
-
-        except Exception as exc:
-            last_error = str(exc)
-            print(f"LLM error: {last_error}")
-
-            if attempt < 2:
-                time.sleep(2)
-
-    raise RuntimeError(
-        f"LLM call failed after retries: {last_error}"
-    )
-
-
-# ============================================================
-# CONTAINERFILE CLEANING
-# ============================================================
-
-def clean_containerfile_response(content):
-    """
-    Removes markdown fences if the LLM accidentally returns:
-
-    ```dockerfile
-    FROM python:3.11
-    ...
-    ```
-    """
-
-    content = safe_str(content).strip()
-
-    content = re.sub(
-        r"^```(?:dockerfile|Dockerfile|containerfile)?\s*",
-        "",
-        content,
-        flags=re.IGNORECASE
-    )
-
-    content = re.sub(
-        r"\s*```$",
-        "",
-        content
-    )
-
-    return content.strip()
-
-
-# ============================================================
-# CONTAINERFILE GENERATION PROMPT
-# ============================================================
-
-def build_initial_containerfile_prompt(context):
-    return f"""
-You are an expert Linux application migration and containerization engineer.
-
-Your task is to generate a production-ready Containerfile/Dockerfile for
-a NON-CONTAINERIZED application currently running on Linux.
-
-Return ONLY the raw Containerfile content.
-
-Do NOT:
-- return Markdown
-- use ```dockerfile
-- provide explanations
-- provide JSON
-- provide comments outside the Containerfile
-
-============================================================
-APPLICATION INFORMATION
-============================================================
-
-Process Information:
-{context.get("process_info", "")}
-
-Working Directory:
-{context.get("working_directory", "")}
-
-Detected Listening Port:
-{context.get("port", "")}
-
-Detected Technology:
-{context.get("technology", "")}
-
-Application Files:
-{json.dumps(context.get("files", []), indent=2)}
-
-Command Outputs:
-{json.dumps(context.get("commands", {}), indent=2)}
-
-============================================================
-GENERAL RULES
-============================================================
-
-1. Identify the actual application technology from the evidence.
-
-2. Use an appropriate stable base image.
-
-3. Do NOT blindly use Alpine.
-   Choose Debian/Ubuntu/slim/alpine only when compatible with the
-   detected application.
-
-4. Do NOT copy:
-   - .git
-   - .env
-   - node_modules
-   - venv
-   - .venv
-   - __pycache__
-   - logs
-   - temporary files
-   - SSH keys
-   - credentials
-   - secrets
-
-5. The application must run in the foreground.
-
-6. The application must bind to:
-   0.0.0.0
-
-7. Use the detected application port where applicable.
-
-8. Do not hard-code an unrelated port.
-
-9. Use WORKDIR.
-
-10. Use explicit COPY commands.
-
-11. Do not copy the host virtual environment.
-
-12. Do not use host networking.
-
-13. Do not use privileged mode.
-
-14. Do not expose secrets through ENV.
-
-15. Prefer a non-root runtime user where practical.
-
-16. The final CMD/ENTRYPOINT must actually start the application.
-
-17. Do not invent files or commands that are not supported by the
-    application evidence unless they are standard and necessary.
-
-============================================================
-PYTHON RULES
-============================================================
-
-If this is Python:
-
-- Select a compatible Python version.
-- Prefer requirements.txt if present.
-- Install dependencies using requirements.txt.
-- Do not copy the existing venv/.venv.
-- Determine the correct startup command from the process information.
-- Flask/FastAPI/etc. applications must bind to 0.0.0.0.
-- If gunicorn/uvicorn is clearly appropriate, use it.
-- Do not assume a module name without evidence.
-
-============================================================
-NODE.JS RULES
-============================================================
-
-If this is Node.js:
-
-- Use a compatible Node version.
-- If package-lock.json exists, prefer:
-
-  npm ci
-
-- If npm ci fails specifically because of legacy peer dependency
-  conflicts, use:
-
-  npm ci --legacy-peer-deps
-
-- If package-lock.json does not exist, use:
-
-  npm install --legacy-peer-deps
-
-- Never copy node_modules.
-- Use package.json scripts when appropriate.
-- For production applications, prefer a production-oriented startup.
-- For Vite/React frontend applications, determine whether the
-  existing application is a development server or production build
-  from the evidence.
-- Ensure the server listens on 0.0.0.0.
-
-============================================================
-JAVA RULES
-============================================================
-
-If this is Java:
-
-- Determine whether the application uses JAR/WAR.
-- Use an appropriate JRE/JDK.
-- Copy the required artifact.
-- Use java -jar when supported by evidence.
-- Do not invent artifact names.
-
-============================================================
-OTHER TECHNOLOGIES
-============================================================
-
-For Go, PHP, Ruby, .NET, Apache, Nginx, etc.:
-
-- Identify the actual runtime from evidence.
-- Use an appropriate official base image.
-- Use the actual application startup command.
-- Do not invent configuration.
-
-============================================================
-IMPORTANT
-============================================================
-
-The Containerfile must be immediately usable for:
-
-1. docker build / podman build
-2. docker run / podman run
-
-The application must remain running after the container starts.
-
-Return ONLY the Containerfile.
-"""
-
-
-def generate_initial_containerfile(context):
-    response = call_llm(
-        build_initial_containerfile_prompt(context)
-    )
-
-    return clean_containerfile_response(response)
-
-
-# ============================================================
-# RETRY / REPAIR PROMPT
-# ============================================================
-
-def build_repair_prompt(
-    context,
-    previous_containerfile,
-    failure_reason,
-    build_logs="",
-    container_logs="",
-    container_inspect="",
-    image_info="",
-    attempt=1
-):
-    return f"""
-You are an expert Linux containerization debugging engineer.
-
-An attempt was made to containerize and run a non-containerized Linux
-application.
-
-The generated Containerfile failed.
-
-Your job is to diagnose the failure and produce a CORRECTED Containerfile.
-
-Return ONLY the complete raw Containerfile.
-
-Do NOT:
-- return Markdown
-- use ```dockerfile
-- provide explanations
-- provide JSON
-- provide text before or after the Containerfile
-
-============================================================
-ATTEMPT
-============================================================
-
-Current repair attempt:
-{attempt}
-
-============================================================
-APPLICATION INFORMATION
-============================================================
-
-Process Information:
-{context.get("process_info", "")}
-
-Working Directory:
-{context.get("working_directory", "")}
-
-Detected Port:
-{context.get("port", "")}
-
-Technology:
-{context.get("technology", "")}
-
-Application Files:
-{json.dumps(context.get("files", []), indent=2)}
-
-Command Outputs:
-{json.dumps(context.get("commands", {}), indent=2)}
-
-============================================================
-PREVIOUS CONTAINERFILE
-============================================================
-
-{previous_containerfile}
-
-============================================================
-FAILURE REASON
-============================================================
-
-{failure_reason}
-
-============================================================
-BUILD LOGS
-============================================================
-
-{build_logs}
-
-============================================================
-CONTAINER LOGS
-============================================================
-
-{container_logs}
-
-============================================================
-CONTAINER INSPECT
-============================================================
-
-{container_inspect}
-
-============================================================
-IMAGE INFORMATION
-============================================================
-
-{image_info}
-
-============================================================
-REPAIR RULES
-============================================================
-
-1. Find the actual root cause.
-
-2. Make the minimum required changes.
-
-3. Do NOT randomly rewrite the application.
-
-4. Do NOT invent dependencies.
-
-5. Do NOT invent application files.
-
-6. Do NOT blindly change the base image.
-
-7. If dependency installation failed:
-   - determine the dependency manager
-   - inspect the available files
-   - use the appropriate installation command.
-
-8. If package-lock.json exists for Node:
-   use npm ci.
-
-9. If npm ci fails specifically because of peer dependencies:
-   use npm ci --legacy-peer-deps.
-
-10. If package-lock.json does not exist:
-    use npm install --legacy-peer-deps.
-
-11. Never copy node_modules.
-
-12. For Python:
-    do not copy the host venv.
-
-13. If the startup command is incorrect:
-    correct it using the process information and application files.
-
-14. If the application exits immediately:
-    make sure the main application process runs in the foreground.
-
-15. If the application binds only to localhost:
-    change it to 0.0.0.0 where the framework supports it.
-
-16. Use the correct detected application port.
-
-17. Do not use host networking.
-
-18. Do not use privileged mode.
-
-19. Do not expose credentials or secrets.
-
-20. Keep the Containerfile buildable by both Docker and Podman
-    wherever possible.
-
-21. The final CMD/ENTRYPOINT must actually start the application.
-
-22. Do not include Markdown.
-
-Return ONLY the corrected Containerfile.
-"""
-
-
-def generate_repaired_containerfile(
-    context,
-    previous_containerfile,
-    failure_reason,
-    build_logs="",
-    container_logs="",
-    container_inspect="",
-    image_info="",
-    attempt=1
-):
-    prompt = build_repair_prompt(
-        context=context,
-        previous_containerfile=previous_containerfile,
-        failure_reason=failure_reason,
-        build_logs=build_logs,
-        container_logs=container_logs,
-        container_inspect=container_inspect,
-        image_info=image_info,
-        attempt=attempt
-    )
-
-    response = call_llm(prompt)
-
-    return clean_containerfile_response(response)
-
-
-# ============================================================
-# SOURCE APPLICATION DISCOVERY
-# ============================================================
-
-def get_process_working_directory(ssh, pid):
-    stdout, stderr, code = ssh_exec(
-        ssh,
-        f"pwdx {shlex.quote(str(pid))}",
-        timeout=30
-    )
-
-    if code != 0:
-        raise RuntimeError(
-            f"Unable to determine working directory: {stderr}"
+            return "# Containerfile generation failed"
+
+        content = (
+            response
+            .json()["choices"][0]["message"]["content"]
+            .strip()
         )
 
-    match = re.search(
-        r"\b\d+\s+(.+)",
-        stdout.strip()
-    )
-
-    if not match:
-        raise RuntimeError(
-            f"Unable to parse pwdx output: {stdout}"
-        )
-
-    return match.group(1).strip()
-
-
-def get_process_info(ssh, pid):
-    stdout, stderr, code = ssh_exec(
-        ssh,
-        f"ps -fp {shlex.quote(str(pid))}",
-        timeout=30
-    )
-
-    return stdout.strip()
-
-
-def get_application_files(ssh, working_directory):
-    command = (
-        f"cd {shlex.quote(working_directory)} && "
-        f"find . -maxdepth 3 -type f "
-        f"! -path './.git/*' "
-        f"! -path './node_modules/*' "
-        f"! -path './venv/*' "
-        f"! -path './.venv/*' "
-        f"! -path './__pycache__/*' "
-        f"! -name '.env' "
-        f"| sort | head -n 500"
-    )
-
-    stdout, stderr, code = ssh_exec(
-        ssh,
-        command,
-        timeout=60
-    )
-
-    if code != 0:
-        return []
-
-    files = []
-
-    for line in stdout.splitlines():
-        line = line.strip()
-
-        if line:
-            files.append(line)
-
-    return files
-
-
-def get_listening_ports(ssh, pid):
-    commands = [
-        f"sudo ss -tunlp | grep 'pid={pid}'",
-        f"ss -tunlp | grep 'pid={pid}'"
-    ]
-
-    for command in commands:
-        stdout, stderr, code = ssh_exec(
-            ssh,
-            command,
-            timeout=30
-        )
-
-        if stdout.strip():
-            return stdout.strip()
-
-    return ""
-
-
-def extract_port(ss_output):
-    if not ss_output:
-        return None
-
-    patterns = [
-        r":(\d+)\s+.*LISTEN",
-        r"127\.0\.0\.1:(\d+)",
-        r"0\.0\.0\.0:(\d+)",
-        r"\[::\]:(\d+)",
-        r"\*:(\d+)"
-    ]
-
-    for pattern in patterns:
-        match = re.search(
-            pattern,
-            ss_output,
+        content = re.sub(
+            r"^```(?:dockerfile|Dockerfile|containerfile|Containerfile)?\s*",
+            "",
+            content,
             flags=re.IGNORECASE
         )
 
-        if match:
-            try:
-                port = int(match.group(1))
-
-                if 1 <= port <= 65535:
-                    return port
-
-            except Exception:
-                pass
-
-    return None
-
-
-def detect_technology(process_info, files):
-    text = (
-        safe_str(process_info) +
-        "\n" +
-        "\n".join(files)
-    ).lower()
-
-    if (
-        "node" in text
-        or "npm" in text
-        or "package.json" in text
-        or "vite" in text
-        or "next" in text
-    ):
-        return "Node.js"
-
-    if (
-        "python" in text
-        or "flask" in text
-        or "fastapi" in text
-        or "django" in text
-        or "uvicorn" in text
-        or "gunicorn" in text
-    ):
-        return "Python"
-
-    if (
-        "java" in text
-        or "jar" in text
-        or "spring" in text
-    ):
-        return "Java"
-
-    if (
-        "dotnet" in text
-        or ".dll" in text
-    ):
-        return ".NET"
-
-    if "php" in text:
-        return "PHP"
-
-    if "ruby" in text:
-        return "Ruby"
-
-    if "go " in text or "golang" in text:
-        return "Go"
-
-    return "Unknown"
-
-
-def read_important_files(ssh, working_directory, files):
-    """
-    Reads a limited set of important files for LLM analysis.
-    """
-
-    important_names = {
-        "package.json",
-        "package-lock.json",
-        "requirements.txt",
-        "pyproject.toml",
-        "Pipfile",
-        "Pipfile.lock",
-        "setup.py",
-        "setup.cfg",
-        "pom.xml",
-        "build.gradle",
-        "build.gradle.kts",
-        "settings.gradle",
-        "go.mod",
-        "composer.json",
-        "Gemfile",
-        "Gemfile.lock",
-        "Dockerfile",
-        "Containerfile",
-        "vite.config.js",
-        "vite.config.ts",
-        "next.config.js",
-        "next.config.mjs",
-        "next.config.ts"
-    }
-
-    result = {}
-
-    for relative_file in files:
-
-        filename = os.path.basename(relative_file)
-
-        if filename not in important_names:
-            continue
-
-        command = (
-            f"cd {shlex.quote(working_directory)} && "
-            f"cat -- {shlex.quote(relative_file)}"
+        content = re.sub(
+            r"\s*```$",
+            "",
+            content
         )
 
-        stdout, stderr, code = ssh_exec(
-            ssh,
-            command,
-            timeout=30
-        )
+        return content.strip()
 
-        if code == 0:
-            result[relative_file] = stdout[:30000]
-
-    return result
+    except Exception as e:
+        print("LLM Containerfile error:", str(e))
+        return f"# Containerfile generation error: {str(e)}"
 
 
 # ============================================================
-# REMOTE FILE TRANSFER
+# CONTAINER STATUS
 # ============================================================
-
-def write_remote_file(ssh, remote_path, content):
-    encoded = base64.b64encode(
-        content.encode("utf-8")
-    ).decode("ascii")
-
-    command = (
-        f"echo {shlex.quote(encoded)} | "
-        f"base64 -d > {shlex.quote(remote_path)}"
-    )
-
-    stdout, stderr, code = ssh_exec(
-        ssh,
-        command,
-        timeout=30
-    )
-
-    if code != 0:
-        raise RuntimeError(
-            f"Unable to write remote file: {stderr}"
-        )
-
-
-def transfer_file_sftp(ssh, local_path, remote_path):
-    sftp = ssh.open_sftp()
-
-    try:
-        sftp.put(
-            local_path,
-            remote_path
-        )
-
-    finally:
-        sftp.close()
-
-
-def create_source_tar(
-    ssh,
-    working_directory,
-    local_tar_path
-):
-    """
-    Creates tar archive on source machine,
-    streams it through SSH to local machine.
-    """
-
-    command = (
-        f"cd {shlex.quote(working_directory)} && "
-        "tar --exclude='.git' "
-        "--exclude='.env' "
-        "--exclude='node_modules' "
-        "--exclude='venv' "
-        "--exclude='.venv' "
-        "--exclude='__pycache__' "
-        "--exclude='*.log' "
-        "-czf - ."
-    )
-
-    stdin, stdout, stderr = ssh.exec_command(
-        command,
-        timeout=300
-    )
-
-    with open(local_tar_path, "wb") as file:
-        while True:
-            chunk = stdout.channel.recv(65536)
-
-            if not chunk:
-                break
-
-            file.write(chunk)
-
-    error = stderr.read().decode(
-        "utf-8",
-        errors="ignore"
-    )
-
-    exit_code = stdout.channel.recv_exit_status()
-
-    if exit_code != 0:
-        raise RuntimeError(
-            f"Failed creating application archive: {error}"
-        )
-
-
-# ============================================================
-# TARGET RUNTIME
-# ============================================================
-
-def detect_container_runtime(ssh):
-    """
-    Detect Docker or Podman on destination VM.
-    """
-
-    stdout, stderr, code = ssh_exec(
-        ssh,
-        "command -v podman || command -v docker",
-        timeout=30
-    )
-
-    if code != 0:
-        raise RuntimeError(
-            "Neither Docker nor Podman is installed on destination VM"
-        )
-
-    path = stdout.strip().splitlines()[0]
-
-    if "podman" in path:
-        return "podman"
-
-    if "docker" in path:
-        return "docker"
-
-    raise RuntimeError(
-        f"Unsupported container runtime: {path}"
-    )
-
-
-def get_runtime_version(ssh, runtime):
-    stdout, stderr, code = ssh_exec(
-        ssh,
-        f"{runtime} --version",
-        timeout=30
-    )
-
-    return stdout.strip()
-
-
-# ============================================================
-# CONTAINER OPERATIONS
-# ============================================================
-
-def remove_container(ssh, runtime, container_name):
-    command = (
-        f"{runtime} rm -f "
-        f"{shlex.quote(container_name)} "
-        "2>/dev/null || true"
-    )
-
-    ssh_exec(
-        ssh,
-        command,
-        timeout=60
-    )
-
-
-def remove_image(ssh, runtime, image_name):
-    command = (
-        f"{runtime} rmi -f "
-        f"{shlex.quote(image_name)} "
-        "2>/dev/null || true"
-    )
-
-    ssh_exec(
-        ssh,
-        command,
-        timeout=60
-    )
-
-
-def build_image(
-    ssh,
-    runtime,
-    image_name,
-    working_directory
-):
-    command = (
-        f"cd {shlex.quote(working_directory)} && "
-        f"{runtime} build --no-cache "
-        f"-t {shlex.quote(image_name)} "
-        "."
-    )
-
-    stdout, stderr, code = ssh_exec(
-        ssh,
-        command,
-        timeout=1200
-    )
-
-    return {
-        "success": code == 0,
-        "stdout": stdout,
-        "stderr": stderr,
-        "exit_code": code
-    }
-
-
-def run_container(
-    ssh,
-    runtime,
-    image_name,
-    container_name,
-    port,
-    working_directory
-):
-    command = (
-        f"{runtime} run -d "
-        f"--name {shlex.quote(container_name)} "
-        f"-p {int(port)}:{int(port)} "
-        f"{shlex.quote(image_name)}"
-    )
-
-    stdout, stderr, code = ssh_exec(
-        ssh,
-        command,
-        timeout=120
-    )
-
-    return {
-        "success": code == 0,
-        "container_id": stdout.strip(),
-        "stdout": stdout,
-        "stderr": stderr,
-        "exit_code": code
-    }
-
 
 def get_container_status(
     ssh,
     runtime,
     container_name
 ):
-    """
-    Uses inspect instead of relying only on docker ps filtering.
-    """
-
-    command = (
-        f"{runtime} inspect "
-        f"{shlex.quote(container_name)} "
-        "2>/dev/null"
+    cmd = (
+        f"sudo {runtime} ps -a "
+        f"--filter name=^{container_name}$ "
+        f"--format '{{{{.ID}}}}|{{{{.Status}}}}'"
     )
 
-    stdout, stderr, code = ssh_exec(
+    exit_code, stdout, stderr = run_remote_command(
         ssh,
-        command,
+        cmd,
         timeout=60
     )
 
-    if code != 0 or not stdout.strip():
+    if exit_code != 0:
         return {
             "exists": False,
             "running": False,
-            "status": "not_created",
-            "raw": stderr or stdout
+            "status": "",
+            "container_id": "",
+            "error": stderr
         }
 
-    try:
-        data = json.loads(stdout)
+    output = stdout.strip()
 
-        if not data:
-            return {
-                "exists": False,
-                "running": False,
-                "status": "not_created",
-                "raw": stdout
-            }
-
-        state = data[0].get("State", {})
-
+    if not output:
         return {
-            "exists": True,
-            "running": bool(state.get("Running")),
-            "status": state.get("Status"),
-            "exit_code": state.get("ExitCode"),
-            "error": state.get("Error"),
-            "started_at": state.get("StartedAt"),
-            "finished_at": state.get("FinishedAt"),
-            "raw": data
-        }
-
-    except Exception:
-        return {
-            "exists": True,
+            "exists": False,
             "running": False,
-            "status": "unknown",
-            "raw": stdout
+            "status": "",
+            "container_id": ""
         }
 
+    parts = output.split("|", 1)
+
+    container_id = parts[0].strip()
+    status = (
+        parts[1].strip()
+        if len(parts) > 1
+        else ""
+    )
+
+    running = status.lower().startswith("up")
+
+    return {
+        "exists": True,
+        "running": running,
+        "status": status,
+        "container_id": container_id
+    }
+
+
+# ============================================================
+# CONTAINER LOGS
+# ============================================================
 
 def get_container_logs(
     ssh,
     runtime,
     container_name
 ):
-    command = (
-        f"{runtime} logs --tail 300 "
-        f"{shlex.quote(container_name)} "
-        "2>&1"
+    cmd = (
+        f"sudo {runtime} logs "
+        f"--tail 300 "
+        f"{container_name}"
     )
 
-    stdout, stderr, code = ssh_exec(
+    exit_code, stdout, stderr = run_remote_command(
         ssh,
-        command,
-        timeout=120
+        cmd,
+        timeout=60
     )
 
-    return stdout
+    if stdout.strip():
+        return stdout
 
+    return stderr
+
+
+# ============================================================
+# CONTAINER INSPECT
+# ============================================================
 
 def get_container_inspect(
     ssh,
     runtime,
     container_name
 ):
-    command = (
-        f"{runtime} inspect "
-        f"{shlex.quote(container_name)} "
-        "2>&1"
+    cmd = (
+        f"sudo {runtime} inspect "
+        f"{container_name}"
     )
 
-    stdout, stderr, code = ssh_exec(
+    exit_code, stdout, stderr = run_remote_command(
         ssh,
-        command,
+        cmd,
         timeout=60
     )
 
-    return stdout
+    if exit_code == 0:
+        return stdout
 
+    return stderr
+
+
+# ============================================================
+# IMAGE CHECK
+# ============================================================
 
 def check_image(
     ssh,
     runtime,
     image_name
 ):
-    command = (
-        f"{runtime} image inspect "
-        f"{shlex.quote(image_name)} "
-        "2>&1"
+    cmd = (
+        f"sudo {runtime} image inspect "
+        f"{image_name}"
     )
 
-    stdout, stderr, code = ssh_exec(
+    exit_code, stdout, stderr = run_remote_command(
         ssh,
-        command,
+        cmd,
         timeout=60
     )
 
     return {
-        "exists": code == 0,
-        "raw": stdout
+        "exists": exit_code == 0,
+        "output": (
+            stdout
+            if exit_code == 0
+            else stderr
+        )
     }
 
 
-def get_container_port_mapping(
-    ssh,
-    runtime,
-    container_name
-):
-    command = (
-        f"{runtime} port "
-        f"{shlex.quote(container_name)} "
-        "2>&1"
-    )
+# ============================================================
+# RUNTIME DETECTION
+# ============================================================
 
-    stdout, stderr, code = ssh_exec(
+def detect_container_runtime(ssh):
+    exit_code, stdout, stderr = run_remote_command(
         ssh,
-        command,
-        timeout=30
+        "command -v docker"
     )
 
-    return stdout.strip()
+    if exit_code == 0 and stdout.strip():
+        return "docker"
+
+    exit_code, stdout, stderr = run_remote_command(
+        ssh,
+        "command -v podman"
+    )
+
+    if exit_code == 0 and stdout.strip():
+        return "podman"
+
+    return None
 
 
 # ============================================================
-# CONTAINERFILE TRANSFER
+# PORT DETECTION
+# ============================================================
+
+def extract_port(port_output, pid):
+    if not port_output:
+        return None
+
+    patterns = [
+        rf":(\d+).*pid={pid}",
+        rf"\.(\d+).*pid={pid}",
+        rf":(\d+).*users:\(\(\".*\",pid={pid}",
+    ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            port_output,
+            re.IGNORECASE
+        )
+
+        if match:
+            return match.group(1)
+
+    matches = re.findall(
+        r"(?:0\.0\.0\.0|127\.0\.0\.1|\[::\]|\*)[:.]([0-9]{2,5})",
+        port_output
+    )
+
+    if matches:
+        return matches[0]
+
+    return None
+
+
+# ============================================================
+# SAFE REMOTE FILE WRITE
+# ============================================================
+
+def write_remote_file(
+    ssh,
+    remote_path,
+    content
+):
+    encoded = base64.b64encode(
+        content.encode("utf-8")
+    ).decode("ascii")
+
+    cmd = (
+        f"echo '{encoded}' | "
+        f"base64 -d > '{remote_path}'"
+    )
+
+    exit_code, stdout, stderr = run_remote_command(
+        ssh,
+        cmd,
+        timeout=60
+    )
+
+    return exit_code, stdout, stderr
+
+
+# ============================================================
+# TRANSFER CONTAINERFILE
 # ============================================================
 
 def transfer_containerfile(
     ssh,
-    target_directory,
-    containerfile
+    target_path,
+    content
 ):
-    """
-    Writes Containerfile to destination.
+    try:
+        sftp = ssh.open_sftp()
 
-    Docker and Podman both understand Containerfile.
-    """
+        with sftp.open(
+            target_path,
+            "wb"
+        ) as remote_file:
+            remote_file.write(
+                content.encode("utf-8")
+            )
 
-    remote_path = (
-        f"{target_directory}/Containerfile"
-    )
+        sftp.close()
 
-    write_remote_file(
-        ssh,
-        remote_path,
-        containerfile
-    )
+        return True, ""
 
-    # Also create Dockerfile for compatibility
-    dockerfile_path = (
-        f"{target_directory}/Dockerfile"
-    )
-
-    write_remote_file(
-        ssh,
-        dockerfile_path,
-        containerfile
-    )
-
-    return remote_path
+    except Exception as e:
+        return False, str(e)
 
 
 # ============================================================
-# FAILURE DIAGNOSIS
+# BUILD + RUN + AUTOMATIC LLM REPAIR
 # ============================================================
 
-def diagnose_failure(
-    build_result,
-    run_result,
-    status,
-    image_info,
-    container_logs,
-    container_inspect
-):
-    if not build_result.get("success"):
-        return "CONTAINER_IMAGE_BUILD_FAILED"
-
-    if not image_info.get("exists"):
-        return "IMAGE_NOT_CREATED_AFTER_BUILD"
-
-    if not run_result.get("success"):
-        return "CONTAINER_RUN_COMMAND_FAILED"
-
-    if not status.get("exists"):
-        return "CONTAINER_WAS_NOT_CREATED"
-
-    if not status.get("running"):
-        return "CONTAINER_CREATED_BUT_NOT_RUNNING"
-
-    return "UNKNOWN_CONTAINER_FAILURE"
-
-
-# ============================================================
-# SINGLE BUILD/RUN ATTEMPT
-# ============================================================
-
-def execute_container_attempt(
+def build_and_run_with_repair(
     ssh,
     runtime,
-    image_name,
     container_name,
-    port,
-    target_directory,
-    containerfile
+    image_name,
+    target_extract_dir,
+    containerfile_content,
+    context,
+    max_attempts=MAX_CONTAINERIZATION_ATTEMPTS
 ):
-    print_step(
-        f"CONTAINERIZATION ATTEMPT - {container_name}"
+    previous_attempt = {}
+
+    containerfile_name = (
+        "Dockerfile"
+        if runtime == "docker"
+        else "Containerfile"
     )
 
-    # --------------------------------------------------------
-    # Replace Containerfile
-    # --------------------------------------------------------
+    target_containerfile_path = os.path.join(
+        target_extract_dir,
+        containerfile_name
+    )
 
-    transfer_containerfile(
+    for attempt in range(
+        1,
+        max_attempts + 1
+    ):
+
+        print("\n" + "=" * 80)
+        print(
+            f"CONTAINERIZATION ATTEMPT "
+            f"{attempt}/{max_attempts}"
+        )
+        print("=" * 80)
+
+        # ====================================================
+        # WRITE/REPLACE CONTAINERFILE
+        # ====================================================
+
+        write_success, write_error = (
+            transfer_containerfile(
+                ssh,
+                target_containerfile_path,
+                containerfile_content
+            )
+        )
+
+        if not write_success:
+
+            previous_attempt = {
+                "attempt": attempt,
+                "containerfile": containerfile_content,
+                "build_logs": "",
+                "container_logs": "",
+                "container_inspect": "",
+                "image_info": "",
+                "failure_reason": (
+                    "Unable to transfer/replace "
+                    "Containerfile on destination."
+                )
+            }
+
+            if attempt >= max_attempts:
+                return {
+                    "success": False,
+                    "attempts": attempt,
+                    "stage": "containerfile_transfer",
+                    "reason": previous_attempt,
+                    "containerfile": containerfile_content,
+                    "containerfile_name": containerfile_name,
+                    "requires_user_edit": True,
+                    "can_retry_with_edited_file": True
+                }
+
+            containerfile_content = (
+                call_llm_for_containerfile(
+                    context,
+                    previous_attempt
+                )
+            )
+
+            continue
+
+        # ====================================================
+        # REMOVE OLD CONTAINER
+        # ====================================================
+
+        existing_status = get_container_status(
+            ssh,
+            runtime,
+            container_name
+        )
+
+        if existing_status["exists"]:
+
+            run_remote_command(
+                ssh,
+                f"sudo {runtime} rm -f "
+                f"{container_name}",
+                timeout=60
+            )
+
+        # ====================================================
+        # BUILD IMAGE
+        # ====================================================
+
+        build_cmd = (
+            f"cd '{target_extract_dir}' && "
+            f"sudo {runtime} build "
+            f"--no-cache "
+            f"-t '{image_name}' "
+            f"."
+        )
+
+        build_exit, build_out, build_err = (
+            run_remote_command(
+                ssh,
+                build_cmd,
+                timeout=BUILD_TIMEOUT
+            )
+        )
+
+        build_logs = (
+            "===== BUILD STDOUT =====\n"
+            + (build_out or "")
+            + "\n\n"
+            + "===== BUILD STDERR =====\n"
+            + (build_err or "")
+        )
+
+        # ====================================================
+        # BUILD FAILED
+        # ====================================================
+
+        if build_exit != 0:
+
+            image_info = check_image(
+                ssh,
+                runtime,
+                image_name
+            )
+
+            previous_attempt = {
+                "attempt": attempt,
+                "containerfile": containerfile_content,
+                "build_logs": build_logs,
+                "container_logs": "",
+                "container_inspect": "",
+                "image_info": image_info["output"],
+                "failure_reason": (
+                    "The container image build failed. "
+                    "Analyze the build logs and repair "
+                    "the Containerfile."
+                )
+            }
+
+            if attempt >= max_attempts:
+                return {
+                    "success": False,
+                    "attempts": attempt,
+                    "stage": "build",
+                    "reason": previous_attempt,
+                    "container_name": container_name,
+                    "image_name": image_name,
+                    "container_runtime": runtime,
+                    "containerfile": containerfile_content,
+                    "containerfile_name": containerfile_name,
+                    "requires_user_edit": True,
+                    "can_retry_with_edited_file": True
+                }
+
+            containerfile_content = (
+                call_llm_for_containerfile(
+                    context,
+                    previous_attempt
+                )
+            )
+
+            continue
+
+        # ====================================================
+        # IMAGE EXISTS?
+        # ====================================================
+
+        image_info = check_image(
+            ssh,
+            runtime,
+            image_name
+        )
+
+        if not image_info["exists"]:
+
+            previous_attempt = {
+                "attempt": attempt,
+                "containerfile": containerfile_content,
+                "build_logs": build_logs,
+                "container_logs": "",
+                "container_inspect": "",
+                "image_info": image_info["output"],
+                "failure_reason": (
+                    "Build returned success but "
+                    "the expected image does not exist."
+                )
+            }
+
+            if attempt >= max_attempts:
+                return {
+                    "success": False,
+                    "attempts": attempt,
+                    "stage": "image",
+                    "reason": previous_attempt,
+                    "container_name": container_name,
+                    "image_name": image_name,
+                    "container_runtime": runtime,
+                    "containerfile": containerfile_content,
+                    "containerfile_name": containerfile_name,
+                    "requires_user_edit": True,
+                    "can_retry_with_edited_file": True
+                }
+
+            containerfile_content = (
+                call_llm_for_containerfile(
+                    context,
+                    previous_attempt
+                )
+            )
+
+            continue
+
+        # ====================================================
+        # PORT
+        # ====================================================
+
+        port = context.get("port")
+
+        if not port:
+            previous_attempt = {
+                "attempt": attempt,
+                "containerfile": containerfile_content,
+                "build_logs": build_logs,
+                "container_logs": "",
+                "container_inspect": "",
+                "image_info": image_info["output"],
+                "failure_reason": (
+                    "Application listening port could not be "
+                    "determined confidently. A port must be "
+                    "provided before the container can be run."
+                )
+            }
+
+            if attempt >= max_attempts:
+                return {
+                    "success": False,
+                    "attempts": attempt,
+                    "stage": "port",
+                    "reason": previous_attempt,
+                    "container_name": container_name,
+                    "image_name": image_name,
+                    "container_runtime": runtime,
+                    "containerfile": containerfile_content,
+                    "containerfile_name": containerfile_name,
+                    "requires_user_edit": True,
+                    "can_retry_with_edited_file": True
+                }
+
+            containerfile_content = (
+                call_llm_for_containerfile(
+                    context,
+                    previous_attempt
+                )
+            )
+
+            continue
+
+        # ====================================================
+        # RUN CONTAINER
+        # ====================================================
+
+        run_cmd = (
+            f"sudo {runtime} run -d "
+            f"--name '{container_name}' "
+            f"-p {port}:{port} "
+            f"'{image_name}'"
+        )
+
+        run_exit, run_out, run_err = (
+            run_remote_command(
+                ssh,
+                run_cmd,
+                timeout=RUN_TIMEOUT
+            )
+        )
+
+        # ====================================================
+        # WAIT FOR APPLICATION
+        # ====================================================
+
+        time.sleep(
+            CONTAINER_START_WAIT
+        )
+
+        # ====================================================
+        # CHECK CONTAINER
+        # ====================================================
+
+        status = get_container_status(
+            ssh,
+            runtime,
+            container_name
+        )
+
+        # ====================================================
+        # SUCCESS
+        # ====================================================
+
+        if (
+            run_exit == 0
+            and status["exists"]
+            and status["running"]
+        ):
+            return {
+                "success": True,
+                "attempts": attempt,
+                "container_name": container_name,
+                "image_name": image_name,
+                "container_runtime": runtime,
+                "port": port,
+                "status": status,
+                "run_command": run_cmd,
+                "containerfile": containerfile_content,
+                "containerfile_name": containerfile_name,
+                "requires_user_edit": False,
+                "can_retry_with_edited_file": False
+            }
+
+        # ====================================================
+        # COLLECT FAILURE INFORMATION
+        # ====================================================
+
+        container_logs = ""
+        container_inspect = ""
+
+        if status["exists"]:
+            container_logs = get_container_logs(
+                ssh,
+                runtime,
+                container_name
+            )
+
+            container_inspect = get_container_inspect(
+                ssh,
+                runtime,
+                container_name
+            )
+
+        image_info = check_image(
+            ssh,
+            runtime,
+            image_name
+        )
+
+        previous_attempt = {
+            "attempt": attempt,
+            "containerfile": containerfile_content,
+            "build_logs": build_logs,
+            "container_logs": container_logs,
+            "container_inspect": container_inspect,
+            "image_info": image_info["output"],
+            "failure_reason": (
+                "Container did not remain running. "
+                "Analyze the run command, container logs, "
+                "inspect output and image information."
+            ),
+            "run_stdout": run_out,
+            "run_stderr": run_err,
+            "container_status": status
+        }
+
+        # ====================================================
+        # MAX ATTEMPTS
+        # ====================================================
+
+        if attempt >= max_attempts:
+
+            return {
+                "success": False,
+                "attempts": attempt,
+                "stage": "runtime",
+                "container_name": container_name,
+                "image_name": image_name,
+                "container_runtime": runtime,
+                "reason": previous_attempt,
+                "containerfile": containerfile_content,
+                "containerfile_name": containerfile_name,
+                "requires_user_edit": True,
+                "can_retry_with_edited_file": True
+            }
+
+        # ====================================================
+        # LLM REPAIR
+        # ====================================================
+
+        containerfile_content = (
+            call_llm_for_containerfile(
+                context,
+                previous_attempt
+            )
+        )
+
+    return {
+        "success": False,
+        "attempts": max_attempts,
+        "stage": "unknown",
+        "containerfile": containerfile_content,
+        "containerfile_name": containerfile_name,
+        "requires_user_edit": True,
+        "can_retry_with_edited_file": True
+    }
+
+
+# ============================================================
+# RUN USER-EDITED CONTAINERFILE
+# ============================================================
+
+def run_user_containerfile(
+    ssh,
+    runtime,
+    container_name,
+    image_name,
+    target_extract_dir,
+    containerfile_content,
+    port
+):
+    """
+    Run a Containerfile/Dockerfile manually edited by the user.
+
+    IMPORTANT:
+    This function DOES NOT transfer the application again.
+
+    The application was already transferred during the original
+    migration. Only the edited Containerfile is replaced and
+    tested.
+    """
+
+    if not containerfile_content:
+        return {
+            "success": False,
+            "stage": "validation",
+            "reason": "Containerfile content is required"
+        }
+
+    if not port:
+        return {
+            "success": False,
+            "stage": "validation",
+            "reason": (
+                "Application port is required to run "
+                "the edited Containerfile."
+            )
+        }
+
+    containerfile_name = (
+        "Dockerfile"
+        if runtime == "docker"
+        else "Containerfile"
+    )
+
+    target_containerfile_path = os.path.join(
+        target_extract_dir,
+        containerfile_name
+    )
+
+    # ========================================================
+    # VERIFY APPLICATION DIRECTORY
+    # ========================================================
+
+    exit_code, stdout, stderr = run_remote_command(
         ssh,
-        target_directory,
-        containerfile
+        f"test -d '{target_extract_dir}'"
     )
 
-    # --------------------------------------------------------
-    # Remove old container
-    # --------------------------------------------------------
+    if exit_code != 0:
+        return {
+            "success": False,
+            "stage": "application_directory",
+            "reason": (
+                "Transferred application directory does not "
+                "exist on destination."
+            ),
+            "containerfile": containerfile_content,
+            "containerfile_name": containerfile_name
+        }
 
-    remove_container(
+    # ========================================================
+    # WRITE EDITED CONTAINERFILE
+    # ========================================================
+
+    transfer_success, transfer_error = (
+        transfer_containerfile(
+            ssh,
+            target_containerfile_path,
+            containerfile_content
+        )
+    )
+
+    if not transfer_success:
+        return {
+            "success": False,
+            "stage": "containerfile_transfer",
+            "reason": transfer_error,
+            "containerfile": containerfile_content,
+            "containerfile_name": containerfile_name
+        }
+
+    # ========================================================
+    # REMOVE OLD CONTAINER
+    # ========================================================
+
+    existing_status = get_container_status(
         ssh,
         runtime,
         container_name
     )
 
-    # --------------------------------------------------------
-    # Build
-    # --------------------------------------------------------
+    if existing_status["exists"]:
+        run_remote_command(
+            ssh,
+            f"sudo {runtime} rm -f '{container_name}'",
+            timeout=60
+        )
 
-    build_result = build_image(
-        ssh=ssh,
-        runtime=runtime,
-        image_name=image_name,
-        working_directory=target_directory
+    # ========================================================
+    # REMOVE OLD IMAGE
+    # ========================================================
+
+    run_remote_command(
+        ssh,
+        f"sudo {runtime} image rm -f '{image_name}'",
+        timeout=120
     )
+
+    # ========================================================
+    # BUILD
+    # ========================================================
+
+    build_cmd = (
+        f"cd '{target_extract_dir}' && "
+        f"sudo {runtime} build "
+        f"--no-cache "
+        f"-t '{image_name}' "
+        f"-f '{containerfile_name}' "
+        f"."
+    )
+
+    build_exit, build_out, build_err = (
+        run_remote_command(
+            ssh,
+            build_cmd,
+            timeout=BUILD_TIMEOUT
+        )
+    )
+
+    build_logs = (
+        "===== BUILD STDOUT =====\n"
+        + (build_out or "")
+        + "\n\n"
+        + "===== BUILD STDERR =====\n"
+        + (build_err or "")
+    )
+
+    if build_exit != 0:
+
+        return {
+            "success": False,
+            "stage": "build",
+            "reason": "Edited Containerfile build failed",
+            "build_logs": build_logs,
+            "container_logs": "",
+            "container_inspect": "",
+            "containerfile": containerfile_content,
+            "containerfile_name": containerfile_name,
+            "requires_user_edit": True,
+            "can_retry_with_edited_file": True
+        }
+
+    # ========================================================
+    # CHECK IMAGE
+    # ========================================================
 
     image_info = check_image(
         ssh,
@@ -1363,68 +1363,45 @@ def execute_container_attempt(
         image_name
     )
 
-    # --------------------------------------------------------
-    # If build failed, do not attempt to run
-    # --------------------------------------------------------
-
-    if not build_result["success"]:
-        return {
-            "success": False,
-            "failure_reason": "CONTAINER_IMAGE_BUILD_FAILED",
-            "build": build_result,
-            "run": {},
-            "status": {
-                "exists": False,
-                "running": False,
-                "status": "build_failed"
-            },
-            "image_info": image_info,
-            "container_logs": "",
-            "container_inspect": ""
-        }
-
-    # --------------------------------------------------------
-    # Image was not created
-    # --------------------------------------------------------
-
     if not image_info["exists"]:
+
         return {
             "success": False,
-            "failure_reason": "IMAGE_NOT_CREATED_AFTER_BUILD",
-            "build": build_result,
-            "run": {},
-            "status": {
-                "exists": False,
-                "running": False,
-                "status": "image_missing"
-            },
-            "image_info": image_info,
-            "container_logs": "",
-            "container_inspect": ""
+            "stage": "image",
+            "reason": (
+                "Build completed but the expected image "
+                "does not exist."
+            ),
+            "build_logs": build_logs,
+            "image_info": image_info["output"],
+            "containerfile": containerfile_content,
+            "containerfile_name": containerfile_name,
+            "requires_user_edit": True,
+            "can_retry_with_edited_file": True
         }
 
-    # --------------------------------------------------------
-    # Run container
-    # --------------------------------------------------------
+    # ========================================================
+    # RUN
+    # ========================================================
 
-    run_result = run_container(
-        ssh=ssh,
-        runtime=runtime,
-        image_name=image_name,
-        container_name=container_name,
-        port=port,
-        working_directory=target_directory
+    run_cmd = (
+        f"sudo {runtime} run -d "
+        f"--name '{container_name}' "
+        f"-p {port}:{port} "
+        f"'{image_name}'"
     )
 
-    # --------------------------------------------------------
-    # Give application time to start
-    # --------------------------------------------------------
+    run_exit, run_out, run_err = (
+        run_remote_command(
+            ssh,
+            run_cmd,
+            timeout=RUN_TIMEOUT
+        )
+    )
 
-    time.sleep(CONTAINER_START_WAIT)
-
-    # --------------------------------------------------------
-    # Check status
-    # --------------------------------------------------------
+    time.sleep(
+        CONTAINER_START_WAIT
+    )
 
     status = get_container_status(
         ssh,
@@ -1432,33 +1409,35 @@ def execute_container_attempt(
         container_name
     )
 
-    # --------------------------------------------------------
-    # Success
-    # --------------------------------------------------------
+    # ========================================================
+    # SUCCESS
+    # ========================================================
 
     if (
-        run_result["success"]
+        run_exit == 0
         and status["exists"]
         and status["running"]
     ):
         return {
             "success": True,
-            "failure_reason": None,
-            "build": build_result,
-            "run": run_result,
+            "attempts": 1,
+            "container_name": container_name,
+            "image_name": image_name,
+            "container_runtime": runtime,
+            "port": port,
             "status": status,
-            "image_info": image_info,
-            "container_logs": "",
-            "container_inspect": ""
+            "run_command": run_cmd,
+            "containerfile": containerfile_content,
+            "containerfile_name": containerfile_name,
+            "requires_user_edit": False,
+            "can_retry_with_edited_file": False
         }
 
-    # --------------------------------------------------------
-    # Container exists but stopped
-    # --------------------------------------------------------
+    # ========================================================
+    # FAILURE
+    # ========================================================
 
     container_logs = ""
-
-    container_inspect = ""
 
     if status["exists"]:
         container_logs = get_container_logs(
@@ -1467,1192 +1446,985 @@ def execute_container_attempt(
             container_name
         )
 
+    container_inspect = ""
+
+    if status["exists"]:
         container_inspect = get_container_inspect(
             ssh,
             runtime,
             container_name
         )
 
-    failure_reason = diagnose_failure(
-        build_result=build_result,
-        run_result=run_result,
-        status=status,
-        image_info=image_info,
-        container_logs=container_logs,
-        container_inspect=container_inspect
-    )
-
     return {
         "success": False,
-        "failure_reason": failure_reason,
-        "build": build_result,
-        "run": run_result,
-        "status": status,
-        "image_info": image_info,
-        "container_logs": container_logs,
-        "container_inspect": container_inspect
-    }
-
-
-# ============================================================
-# AUTOMATIC CONTAINERIZATION WITH LLM REPAIR
-# ============================================================
-
-def build_and_run_with_repair(
-    ssh,
-    runtime,
-    image_name,
-    container_name,
-    port,
-    target_directory,
-    context,
-    initial_containerfile
-):
-    """
-    Maximum five automatic attempts.
-
-    Attempt 1:
-        Initial LLM generated Containerfile
-
-    Attempt 2-5:
-        Failure evidence -> LLM repair -> replace Containerfile
-        -> build -> run -> verify
-    """
-
-    containerfile = initial_containerfile
-
-    attempt_history = []
-
-    latest_result = None
-
-    for attempt in range(1, MAX_CONTAINERIZATION_ATTEMPTS + 1):
-
-        print_step(
-            f"AUTOMATIC CONTAINERIZATION ATTEMPT "
-            f"{attempt}/{MAX_CONTAINERIZATION_ATTEMPTS}"
-        )
-
-        result = execute_container_attempt(
-            ssh=ssh,
-            runtime=runtime,
-            image_name=image_name,
-            container_name=container_name,
-            port=port,
-            target_directory=target_directory,
-            containerfile=containerfile
-        )
-
-        latest_result = result
-
-        attempt_record = {
-            "attempt": attempt,
-            "failure_reason": result.get("failure_reason"),
-            "success": result.get("success"),
-            "status": result.get("status"),
-            "build_exit_code": result.get(
-                "build", {}
-            ).get("exit_code"),
-            "run_exit_code": result.get(
-                "run", {}
-            ).get("exit_code")
-        }
-
-        attempt_history.append(attempt_record)
-
-        # ----------------------------------------------------
-        # SUCCESS
-        # ----------------------------------------------------
-
-        if result["success"]:
-
-            return {
-                "success": True,
-                "attempts": attempt,
-                "containerfile": containerfile,
-                "attempt_history": attempt_history,
-                "latest_result": result
-            }
-
-        # ----------------------------------------------------
-        # Maximum attempts reached
-        # ----------------------------------------------------
-
-        if attempt >= MAX_CONTAINERIZATION_ATTEMPTS:
-
-            return {
-                "success": False,
-                "attempts": attempt,
-                "containerfile": containerfile,
-                "attempt_history": attempt_history,
-                "latest_result": result
-            }
-
-        # ----------------------------------------------------
-        # Collect failure evidence
-        # ----------------------------------------------------
-
-        build_logs = (
-            result.get("build", {}).get("stdout", "")
-            + "\n"
-            + result.get("build", {}).get("stderr", "")
-        )
-
-        run_logs = (
-            result.get("run", {}).get("stdout", "")
-            + "\n"
-            + result.get("run", {}).get("stderr", "")
-        )
-
-        container_logs = result.get(
-            "container_logs",
-            ""
-        )
-
-        container_inspect = result.get(
-            "container_inspect",
-            ""
-        )
-
-        image_info = result.get(
-            "image_info",
-            {}
-        )
-
-        # Include run failure in diagnosis too
-        failure_reason = (
-            f"{result.get('failure_reason')}\n"
-            f"Run result:\n{run_logs}"
-        )
-
-        # ----------------------------------------------------
-        # Ask LLM to repair
-        # ----------------------------------------------------
-
-        print_step(
-            f"LLM REPAIR FOR ATTEMPT {attempt + 1}"
-        )
-
-        try:
-            repaired_containerfile = (
-                generate_repaired_containerfile(
-                    context=context,
-                    previous_containerfile=containerfile,
-                    failure_reason=failure_reason,
-                    build_logs=build_logs,
-                    container_logs=container_logs,
-                    container_inspect=container_inspect,
-                    image_info=json.dumps(
-                        image_info,
-                        indent=2,
-                        default=str
-                    ),
-                    attempt=attempt + 1
-                )
-            )
-
-            if not repaired_containerfile.strip():
-                raise RuntimeError(
-                    "LLM returned an empty Containerfile"
-                )
-
-            containerfile = repaired_containerfile
-
-        except Exception as exc:
-            print(
-                f"LLM repair failed: {exc}"
-            )
-
-            return {
-                "success": False,
-                "attempts": attempt,
-                "containerfile": containerfile,
-                "attempt_history": attempt_history,
-                "latest_result": result,
-                "llm_error": str(exc)
-            }
-
-    return {
-        "success": False,
-        "attempts": MAX_CONTAINERIZATION_ATTEMPTS,
-        "containerfile": containerfile,
-        "attempt_history": attempt_history,
-        "latest_result": latest_result
-    }
-
-
-# ============================================================
-# MIGRATION STATE
-# ============================================================
-
-"""
-Temporary in-memory migration storage.
-
-For production, replace this with PostgreSQL/Redis.
-
-The important point is:
-the UI does NOT need to receive the SSH password.
-
-The backend stores the connection information temporarily and
-the UI only receives migration_id.
-"""
-
-MIGRATION_SESSIONS = {}
-
-
-def create_migration_session(
-    migration_id,
-    target,
-    runtime,
-    image_name,
-    container_name,
-    port,
-    target_directory
-):
-    MIGRATION_SESSIONS[migration_id] = {
-        "migration_id": migration_id,
-        "target": target,
-        "runtime": runtime,
-        "image_name": image_name,
+        "attempts": 1,
+        "stage": "runtime",
         "container_name": container_name,
+        "image_name": image_name,
+        "container_runtime": runtime,
         "port": port,
-        "target_directory": target_directory,
-        "created_at": time.time()
+        "reason": (
+            "Edited Containerfile built successfully, "
+            "but the container is not running."
+        ),
+        "build_logs": build_logs,
+        "container_logs": container_logs,
+        "container_inspect": container_inspect,
+        "run_stdout": run_out,
+        "run_stderr": run_err,
+        "status": status,
+        "containerfile": containerfile_content,
+        "containerfile_name": containerfile_name,
+        "requires_user_edit": True,
+        "can_retry_with_edited_file": True
     }
 
 
-def get_migration_session(migration_id):
-    return MIGRATION_SESSIONS.get(
-        migration_id
-    )
-
-
 # ============================================================
-# MAIN MIGRATION FUNCTION
+# RUN EDITED CONTAINERFILE API
 # ============================================================
 
-def migrate_non_container_application(
-    source,
-    target,
-    pid
-):
-    """
-    Main migration workflow.
-    """
+@bp.route(
+    "/api/non-container-to-container-run-edited",
+    methods=["POST"]
+)
+def non_container_to_container_run_edited():
 
-    migration_id = str(uuid.uuid4())
-
-    source_ssh = None
-    target_ssh = None
-
-    local_tar = None
+    ssh = None
 
     try:
 
+        data = request.get_json()
+
+        if not data:
+            return jsonify({
+                "error": "Request body is required",
+                "status": 400
+            }), 400
+
+        pid = data.get("pid")
+        port = data.get("port")
+        containerfile = data.get("containerfile")
+        target = data.get("target") or {}
+
+        if not pid:
+            return jsonify({
+                "error": "pid is required",
+                "status": 400
+            }), 400
+
+        if not containerfile:
+            return jsonify({
+                "error": "containerfile is required",
+                "status": 400
+            }), 400
+
+        target_host = target.get("ip")
+        target_user = target.get("TargetUsername")
+        target_password = target.get("TargetPassword")
+
+        if not target_host:
+            return jsonify({
+                "error": "Target IP is required",
+                "status": 400
+            }), 400
+
+        if not target_user:
+            return jsonify({
+                "error": "Target username is required",
+                "status": 400
+            }), 400
+
         # ====================================================
-        # SOURCE CONNECTION
+        # CONNECT TARGET
         # ====================================================
 
-        print_step("CONNECTING TO SOURCE VM")
+        ssh = paramiko.SSHClient()
 
-        source_ssh = connect_ssh(
-            host=source["ip"],
-            username=source["username"],
-            password=source.get("password"),
-            port=source.get("port", 22)
+        ssh.set_missing_host_key_policy(
+            paramiko.AutoAddPolicy()
         )
 
-        # ====================================================
-        # DISCOVER APPLICATION
-        # ====================================================
-
-        print_step("DISCOVERING APPLICATION")
-
-        working_directory = get_process_working_directory(
-            source_ssh,
-            pid
-        )
-
-        process_info = get_process_info(
-            source_ssh,
-            pid
-        )
-
-        files = get_application_files(
-            source_ssh,
-            working_directory
-        )
-
-        important_files = read_important_files(
-            source_ssh,
-            working_directory,
-            files
-        )
-
-        port_output = get_listening_ports(
-            source_ssh,
-            pid
-        )
-
-        detected_port = extract_port(
-            port_output
-        )
-
-        if not detected_port:
-            detected_port = 8080
-
-        technology = detect_technology(
-            process_info,
-            files
-        )
-
-        print_step("APPLICATION DISCOVERY RESULT")
-
-        print(
-            json.dumps(
-                {
-                    "working_directory": working_directory,
-                    "process_info": process_info,
-                    "port_output": port_output,
-                    "port": detected_port,
-                    "technology": technology,
-                    "files": files
-                },
-                indent=2
-            )
+        ssh.connect(
+            target_host,
+            username=target_user,
+            password=target_password,
+            timeout=30
         )
 
         # ====================================================
-        # LLM CONTEXT
-        # ====================================================
-
-        context = {
-            "process_info": process_info,
-            "working_directory": working_directory,
-            "port": detected_port,
-            "technology": technology,
-            "files": files,
-            "commands": {
-                "listening_ports": port_output,
-                "important_files": important_files
-            }
-        }
-
-        # ====================================================
-        # GENERATE INITIAL CONTAINERFILE
-        # ====================================================
-
-        print_step(
-            "GENERATING INITIAL CONTAINERFILE"
-        )
-
-        containerfile = (
-            generate_initial_containerfile(
-                context
-            )
-        )
-
-        if not containerfile.strip():
-            raise RuntimeError(
-                "LLM returned empty Containerfile"
-            )
-
-        print_step("GENERATED CONTAINERFILE")
-
-        print(containerfile)
-
-        # ====================================================
-        # CREATE LOCAL TEMP ARCHIVE
-        # ====================================================
-
-        local_tar = os.path.join(
-            "/tmp",
-            f"migration_{migration_id}.tar.gz"
-        )
-
-        print_step(
-            "CREATING APPLICATION ARCHIVE"
-        )
-
-        create_source_tar(
-            source_ssh,
-            working_directory,
-            local_tar
-        )
-
-        # ====================================================
-        # TARGET CONNECTION
-        # ====================================================
-
-        print_step("CONNECTING TO TARGET VM")
-
-        target_ssh = connect_ssh(
-            host=target["ip"],
-            username=target["username"],
-            password=target.get("password"),
-            port=target.get("port", 22)
-        )
-
-        # ====================================================
-        # DETECT DOCKER / PODMAN
+        # DETECT RUNTIME
         # ====================================================
 
         runtime = detect_container_runtime(
-            target_ssh
+            ssh
         )
 
-        runtime_version = get_runtime_version(
-            target_ssh,
-            runtime
-        )
-
-        print(
-            f"Container runtime: {runtime}"
-        )
-
-        print(
-            f"Runtime version: {runtime_version}"
-        )
+        if not runtime:
+            return jsonify({
+                "error": (
+                    "Neither Docker nor Podman is installed "
+                    "or available on the destination."
+                ),
+                "status": 500
+            }), 500
 
         # ====================================================
-        # CONTAINER NAMES
+        # TARGET DIRECTORY
         # ====================================================
 
-        safe_pid = re.sub(
-            r"[^a-zA-Z0-9_.-]",
-            "",
-            str(pid)
+        target_extract_dir = (
+            f"/home/{target_user}/{pid}_app"
         )
 
         container_name = (
-            f"migrated-app-{safe_pid}"
+            f"app-{pid}"
         )
 
         image_name = (
-            f"migrated-app-{safe_pid}:latest"
-        )
-
-        target_user = target["username"]
-
-        target_directory = (
-            f"/home/{target_user}/"
-            f"non_container_migration_{safe_pid}"
+            f"app-{pid}"
         )
 
         # ====================================================
-        # CREATE TARGET DIRECTORY
+        # RUN EDITED FILE
         # ====================================================
 
-        stdout, stderr, code = ssh_exec(
-            target_ssh,
-            (
-                f"mkdir -p "
-                f"{shlex.quote(target_directory)}"
-            ),
-            timeout=60
-        )
-
-        if code != 0:
-            raise RuntimeError(
-                f"Unable to create target directory: "
-                f"{stderr}"
-            )
-
-        # ====================================================
-        # TRANSFER APPLICATION ARCHIVE
-        # ====================================================
-
-        print_step(
-            "TRANSFERRING APPLICATION TO TARGET"
-        )
-
-        remote_tar = (
-            f"{target_directory}/application.tar.gz"
-        )
-
-        transfer_file_sftp(
-            target_ssh,
-            local_tar,
-            remote_tar
-        )
-
-        # ====================================================
-        # EXTRACT APPLICATION
-        # ====================================================
-
-        print_step(
-            "EXTRACTING APPLICATION ON TARGET"
-        )
-
-        extract_command = (
-            f"cd {shlex.quote(target_directory)} && "
-            f"tar -xzf application.tar.gz && "
-            f"rm -f application.tar.gz"
-        )
-
-        stdout, stderr, code = ssh_exec(
-            target_ssh,
-            extract_command,
-            timeout=300
-        )
-
-        if code != 0:
-            raise RuntimeError(
-                f"Unable to extract application: "
-                f"{stderr}"
-            )
-
-        # ====================================================
-        # IMPORTANT:
-        # Always overwrite Containerfile AFTER extraction.
-        #
-        # The source application might itself contain a
-        # Dockerfile/Containerfile.
-        # ====================================================
-
-        transfer_containerfile(
-            target_ssh,
-            target_directory,
-            containerfile
-        )
-
-        # ====================================================
-        # SAVE MIGRATION SESSION
-        # ====================================================
-
-        create_migration_session(
-            migration_id=migration_id,
-            target=target,
+        result = run_user_containerfile(
+            ssh=ssh,
             runtime=runtime,
-            image_name=image_name,
             container_name=container_name,
-            port=detected_port,
-            target_directory=target_directory
+            image_name=image_name,
+            target_extract_dir=target_extract_dir,
+            containerfile_content=containerfile,
+            port=port
         )
 
-        # ====================================================
-        # AUTOMATIC BUILD/RUN + LLM REPAIR
-        # ====================================================
+        if result.get("success"):
 
-        result = build_and_run_with_repair(
-            ssh=target_ssh,
-            runtime=runtime,
-            image_name=image_name,
-            container_name=container_name,
-            port=detected_port,
-            target_directory=target_directory,
-            context=context,
-            initial_containerfile=containerfile
-        )
-
-        # ====================================================
-        # SUCCESS
-        # ====================================================
-
-        if result["success"]:
-
-            return {
-                "status": "success",
-                "migration_id": migration_id,
+            return jsonify({
                 "message": (
-                    "Application successfully "
-                    "containerized and running "
-                    "on destination VM."
+                    f"Application {pid} successfully "
+                    f"started using the edited "
+                    f"{result.get('containerfile_name')}"
                 ),
-                "pid": pid,
-                "container_runtime": runtime,
-                "container_name": container_name,
-                "image_name": image_name,
-                "port": detected_port,
-                "attempts": result["attempts"],
-                "container_status": result[
-                    "latest_result"
-                ]["status"],
-                "containerfile": result[
+                "container_name": result.get(
+                    "container_name"
+                ),
+                "image_name": result.get(
+                    "image_name"
+                ),
+                "container_runtime": result.get(
+                    "container_runtime"
+                ),
+                "port": result.get("port"),
+                "run_command": result.get(
+                    "run_command"
+                ),
+                "attempts": result.get(
+                    "attempts",
+                    1
+                ),
+                "containerfile": result.get(
                     "containerfile"
-                ],
-                "attempt_history": result[
-                    "attempt_history"
-                ]
-            }
+                ),
+                "containerfile_name": result.get(
+                    "containerfile_name"
+                ),
+                "requires_user_edit": False,
+                "can_retry_with_edited_file": False,
+                "status": "running",
+                "status_code": 200
+            }), 200
 
-        # ====================================================
-        # FIVE ATTEMPTS FAILED
-        # ====================================================
-
-        latest = result.get(
-            "latest_result",
-            {}
-        )
-
-        return {
-            "status": "manual_intervention_required",
-            "migration_id": migration_id,
+        return jsonify({
             "message": (
-                "Automatic containerization failed after "
-                f"{result.get('attempts', MAX_CONTAINERIZATION_ATTEMPTS)} "
-                "attempts. The generated Containerfile is "
-                "returned to the UI. Edit the Containerfile "
-                "and submit it using "
-                "/api/non-container-to-container-run-edited."
+                "Edited Containerfile failed. "
+                "You can edit it and run it again."
             ),
-            "pid": pid,
-            "container_runtime": runtime,
-            "container_name": container_name,
-            "image_name": image_name,
-            "port": detected_port,
+            "container_name": result.get(
+                "container_name",
+                container_name
+            ),
+            "image_name": result.get(
+                "image_name",
+                image_name
+            ),
+            "container_runtime": result.get(
+                "container_runtime",
+                runtime
+            ),
+            "port": result.get("port", port),
             "attempts": result.get(
                 "attempts",
-                MAX_CONTAINERIZATION_ATTEMPTS
+                1
+            ),
+            "stage": result.get("stage"),
+            "failure_details": result.get(
+                "reason"
+            ),
+            "build_logs": result.get(
+                "build_logs",
+                ""
+            ),
+            "container_logs": result.get(
+                "container_logs",
+                ""
+            ),
+            "container_inspect": result.get(
+                "container_inspect",
+                ""
+            ),
+            "run_stdout": result.get(
+                "run_stdout",
+                ""
+            ),
+            "run_stderr": result.get(
+                "run_stderr",
+                ""
+            ),
+            "container_status": result.get(
+                "status"
             ),
             "containerfile": result.get(
                 "containerfile",
                 containerfile
             ),
-            "failure_reason": latest.get(
-                "failure_reason"
-            ),
-            "build_logs": (
-                latest.get("build", {}).get(
-                    "stdout", ""
-                )
-                + "\n"
-                + latest.get("build", {}).get(
-                    "stderr", ""
+            "containerfile_name": result.get(
+                "containerfile_name",
+                (
+                    "Dockerfile"
+                    if runtime == "docker"
+                    else "Containerfile"
                 )
             ),
-            "container_logs": latest.get(
-                "container_logs",
-                ""
-            ),
-            "container_inspect": latest.get(
-                "container_inspect",
-                ""
-            ),
-            "image_info": latest.get(
-                "image_info",
-                {}
-            ),
-            "attempt_history": result.get(
-                "attempt_history",
-                []
-            )
-        }
+            "requires_user_edit": True,
+            "can_retry_with_edited_file": True,
+            "status": 500
+        }), 500
+
+    except Exception as e:
+
+        print(
+            "\nEdited Containerfile execution error:"
+        )
+
+        print(
+            str(e)
+        )
+
+        return jsonify({
+            "error": str(e),
+            "status": 500
+        }), 500
 
     finally:
 
-        # ====================================================
-        # CLOSE SSH CONNECTIONS
-        # ====================================================
-
-        if source_ssh:
-            source_ssh.close()
-
-        if target_ssh:
-            target_ssh.close()
-
-        # ====================================================
-        # REMOVE LOCAL TEMP ARCHIVE
-        # ====================================================
-
-        if local_tar and os.path.exists(local_tar):
-            try:
-                os.remove(local_tar)
-            except Exception:
-                pass
-
-
-# ============================================================
-# FLASK APP
-# ============================================================
-
-from flask import Flask, request, jsonify
-
-
-app = Flask(__name__)
+        try:
+            if ssh:
+                ssh.close()
+        except Exception:
+            pass
 
 
 # ============================================================
 # MAIN API
 # ============================================================
 
-@app.route(
+@bp.route(
     "/api/non-container-to-container-migrate",
     methods=["POST"]
 )
 def non_container_to_container_migrate():
 
+    ssh1 = None
+    ssh2 = None
+    sftp1 = None
+    sftp2 = None
+
+    source_temp_dir = None
+    target_extract_dir = None
+    target_tar_path = None
+
     try:
 
-        data = request.get_json(
-            silent=True
-        ) or {}
+        # ====================================================
+        # REQUEST
+        # ====================================================
 
-        source = data.get("source", {})
-        target = data.get("target", {})
+        data = request.get_json()
+
+        if not data:
+            return jsonify({
+                "error": "Request body is required",
+                "status": 400
+            }), 400
+
         pid = data.get("pid")
+        tech_stack = data.get("tech_stack")
+        source = data.get("source") or {}
+        target = data.get("target") or {}
 
         if not pid:
             return jsonify({
-                "status": "error",
-                "message": "pid is required"
+                "error": "pid is required",
+                "status": 400
             }), 400
 
-        if not source.get("ip"):
-            return jsonify({
-                "status": "error",
-                "message": "source.ip is required"
-            }), 400
+        # ====================================================
+        # SOURCE DETAILS
+        # ====================================================
 
-        if not source.get("username"):
-            return jsonify({
-                "status": "error",
-                "message": "source.username is required"
-            }), 400
+        source_host = source.get("host")
+        source_user = source.get("user")
+        source_password = source.get("password")
+        source_sudo = source.get("sudo_password")
 
-        if not target.get("ip"):
-            return jsonify({
-                "status": "error",
-                "message": "target.ip is required"
-            }), 400
+        # ====================================================
+        # TARGET DETAILS
+        # ====================================================
 
-        if not target.get("username"):
-            return jsonify({
-                "status": "error",
-                "message": "target.username is required"
-            }), 400
+        target_host = target.get("ip")
+        target_user = target.get("TargetUsername")
+        target_password = target.get("TargetPassword")
+        target_sudo = target.get("TargetSudoPassword")
 
-        result = migrate_non_container_application(
-            source=source,
-            target=target,
-            pid=pid
+        if not source_host:
+            raise Exception(
+                "Source host is required"
+            )
+
+        if not source_user:
+            raise Exception(
+                "Source username is required"
+            )
+
+        if not target_host:
+            raise Exception(
+                "Target IP is required"
+            )
+
+        if not target_user:
+            raise Exception(
+                "Target username is required"
+            )
+
+        # ====================================================
+        # CONNECT SOURCE
+        # ====================================================
+
+        print(
+            "\nConnecting to source:"
         )
 
-        return jsonify(result), 200
+        print(source_host)
 
-    except Exception as exc:
+        ssh1 = paramiko.SSHClient()
 
-        print_step("MIGRATION FAILED")
-
-        import traceback
-        traceback.print_exc()
-
-        return jsonify({
-            "status": "error",
-            "message": str(exc)
-        }), 500
-
-
-# ============================================================
-# RUN USER-EDITED CONTAINERFILE
-# ============================================================
-
-@app.route(
-    "/api/non-container-to-container-run-edited",
-    methods=["POST"]
-)
-def run_edited_containerfile():
-
-    """
-    Called by UI after automatic 5 attempts fail.
-
-    Expected request:
-
-    {
-        "migration_id": "...",
-        "containerfile": "FROM ...",
-        "port": 8015
-    }
-
-    The UI does NOT need to send SSH credentials again.
-    """
-
-    target_ssh = None
-
-    try:
-
-        data = request.get_json(
-            silent=True
-        ) or {}
-
-        migration_id = data.get(
-            "migration_id"
+        ssh1.set_missing_host_key_policy(
+            paramiko.AutoAddPolicy()
         )
 
-        edited_containerfile = data.get(
-            "containerfile"
+        ssh1.connect(
+            source_host,
+            username=source_user,
+            password=source_password,
+            timeout=30
         )
 
-        if not migration_id:
-            return jsonify({
-                "status": "error",
-                "message": "migration_id is required"
-            }), 400
+        # ====================================================
+        # GET PROCESS WORKING DIRECTORY
+        # ====================================================
 
-        if not edited_containerfile:
-            return jsonify({
-                "status": "error",
-                "message": "containerfile is required"
-            }), 400
-
-        session = get_migration_session(
-            migration_id
-        )
-
-        if not session:
-            return jsonify({
-                "status": "error",
-                "message": (
-                    "Migration session not found "
-                    "or has expired."
-                )
-            }), 404
-
-        # ----------------------------------------------------
-        # Use UI Containerfile exactly as supplied
-        # ----------------------------------------------------
-
-        edited_containerfile = (
-            clean_containerfile_response(
-                edited_containerfile
+        exit_code, pid_path_out, err = (
+            run_remote_command(
+                ssh1,
+                f"pwdx {pid}"
             )
         )
 
-        target = session["target"]
+        if exit_code != 0:
+            raise Exception(
+                f"Could not get path for PID {pid}: {err}"
+            )
 
-        target_ssh = connect_ssh(
-            host=target["ip"],
-            username=target["username"],
-            password=target.get("password"),
-            port=target.get("port", 22)
+        original_path = (
+            pid_path_out
+            .split(":")[-1]
+            .strip()
         )
 
-        runtime = session["runtime"]
+        if not original_path:
+            raise Exception(
+                f"Could not determine working directory "
+                f"for PID {pid}"
+            )
 
-        # ----------------------------------------------------
-        # Allow UI to change port if required
-        # ----------------------------------------------------
-
-        port = data.get(
-            "port",
-            session["port"]
+        print(
+            "\nApplication working directory:"
         )
 
-        try:
-            port = int(port)
-        except Exception:
-            port = session["port"]
+        print(original_path)
 
-        image_name = session[
-            "image_name"
-        ]
+        # ====================================================
+        # PROCESS INFORMATION
+        # ====================================================
 
-        container_name = session[
-            "container_name"
-        ]
-
-        target_directory = session[
-            "target_directory"
-        ]
-
-        # ----------------------------------------------------
-        # Replace Containerfile
-        # ----------------------------------------------------
-
-        transfer_containerfile(
-            target_ssh,
-            target_directory,
-            edited_containerfile
+        exit_code, ps_out, err = (
+            run_remote_command(
+                ssh1,
+                f"ps -fp {pid}"
+            )
         )
 
-        # ----------------------------------------------------
-        # Remove old container
-        # ----------------------------------------------------
+        if exit_code != 0:
+            print(
+                "WARNING: ps command failed:",
+                err
+            )
 
-        remove_container(
-            target_ssh,
-            runtime,
-            container_name
+        # ====================================================
+        # APPLICATION FILES
+        # ====================================================
+
+        exit_code, ls_out, err = (
+            run_remote_command(
+                ssh1,
+                f"ls -la '{original_path}'"
+            )
         )
 
-        # ----------------------------------------------------
-        # Build
-        # ----------------------------------------------------
+        if exit_code != 0:
+            raise Exception(
+                f"Unable to list application files: {err}"
+            )
 
-        build_result = build_image(
-            ssh=target_ssh,
-            runtime=runtime,
-            image_name=image_name,
-            working_directory=target_directory
+        files = ls_out.splitlines()
+
+        # ====================================================
+        # LISTENING PORT
+        # ====================================================
+
+        exit_code, port_out, err = (
+            run_remote_command(
+                ssh1,
+                f"sudo ss -tunlp | grep 'pid={pid}'"
+            )
         )
 
-        image_info = check_image(
-            target_ssh,
-            runtime,
-            image_name
+        if exit_code != 0:
+            print(
+                "WARNING: Could not determine "
+                "application port:"
+            )
+
+            print(err)
+
+        print(
+            "\nPort information:"
         )
 
-        # ----------------------------------------------------
-        # Build failed
-        # ----------------------------------------------------
+        print(port_out)
 
-        if not build_result["success"]:
-
-            return jsonify({
-                "status": "manual_retry_required",
-                "message": (
-                    "Edited Containerfile failed "
-                    "during image build."
-                ),
-                "migration_id": migration_id,
-                "container_runtime": runtime,
-                "container_name": container_name,
-                "image_name": image_name,
-                "port": port,
-                "containerfile": edited_containerfile,
-                "build_logs": (
-                    build_result.get(
-                        "stdout",
-                        ""
-                    )
-                    + "\n"
-                    + build_result.get(
-                        "stderr",
-                        ""
-                    )
-                ),
-                "image_info": image_info
-            }), 200
-
-        # ----------------------------------------------------
-        # Image missing
-        # ----------------------------------------------------
-
-        if not image_info["exists"]:
-
-            return jsonify({
-                "status": "manual_retry_required",
-                "message": (
-                    "Build command completed but "
-                    "the image was not found."
-                ),
-                "migration_id": migration_id,
-                "container_runtime": runtime,
-                "container_name": container_name,
-                "image_name": image_name,
-                "port": port,
-                "containerfile": edited_containerfile,
-                "build_logs": (
-                    build_result.get(
-                        "stdout",
-                        ""
-                    )
-                    + "\n"
-                    + build_result.get(
-                        "stderr",
-                        ""
-                    )
-                ),
-                "image_info": image_info
-            }), 200
-
-        # ----------------------------------------------------
-        # Run edited Containerfile
-        # ----------------------------------------------------
-
-        run_result = run_container(
-            ssh=target_ssh,
-            runtime=runtime,
-            image_name=image_name,
-            container_name=container_name,
-            port=port,
-            working_directory=target_directory
+        detected_port = extract_port(
+            port_out,
+            pid
         )
 
-        time.sleep(
-            CONTAINER_START_WAIT
+        print(
+            "\nDetected application port:"
         )
 
-        # ----------------------------------------------------
-        # Check status
-        # ----------------------------------------------------
+        print(detected_port)
 
-        status = get_container_status(
-            target_ssh,
-            runtime,
-            container_name
+        # ====================================================
+        # APPLICATION CONTEXT
+        # ====================================================
+
+        context = {
+            "pid": pid,
+            "working_directory": original_path,
+            "process_info": ps_out,
+            "files": files,
+            "tech_stack": tech_stack,
+            "port_info": port_out,
+            "port": detected_port
+        }
+
+        # ====================================================
+        # INITIAL LLM CONTAINERFILE
+        # ====================================================
+
+        print(
+            "\n"
+            + "=" * 80
         )
 
-        # ----------------------------------------------------
-        # SUCCESS
-        # ----------------------------------------------------
+        print(
+            "GENERATING INITIAL CONTAINERFILE"
+        )
+
+        print(
+            "=" * 80
+        )
+
+        dockerfile_content = (
+            call_llm_for_containerfile(
+                context
+            )
+        )
 
         if (
-            run_result["success"]
-            and status["exists"]
-            and status["running"]
-        ):
-
-            # Update session port/containerfile
-            session["port"] = port
-            session["containerfile"] = (
-                edited_containerfile
+            not dockerfile_content
+            or dockerfile_content.startswith(
+                "# Containerfile generation"
             )
+        ):
+            raise Exception(
+                "LLM failed to generate Containerfile"
+            )
+
+        print(
+            "\nGenerated Containerfile:"
+        )
+
+        print(
+            dockerfile_content
+        )
+
+        # ====================================================
+        # SOURCE TEMP DIRECTORY
+        # ====================================================
+
+        source_temp_dir = create_remote_temp_dir(
+            ssh1,
+            f"/home/{source_user}"
+        )
+
+        dockerfile_path = os.path.join(
+            source_temp_dir,
+            "Dockerfile"
+        )
+
+        tar_path = os.path.join(
+            source_temp_dir,
+            f"{pid}.tar"
+        )
+
+        # ====================================================
+        # WRITE INITIAL CONTAINERFILE TO SOURCE
+        # ====================================================
+
+        exit_code, out, err = write_remote_file(
+            ssh1,
+            dockerfile_path,
+            dockerfile_content
+        )
+
+        if exit_code != 0:
+            raise Exception(
+                f"Failed to write Containerfile "
+                f"on source: {err}"
+            )
+
+        # ====================================================
+        # CREATE APPLICATION TAR
+        # ====================================================
+
+        print(
+            "\nCreating application archive..."
+        )
+
+        tar_cmd = (
+            f"cd '{original_path}' && "
+            f"tar -cf '{tar_path}' "
+            f"--exclude=venv "
+            f"--exclude=.venv "
+            f"--exclude=node_modules "
+            f"--exclude=__pycache__ "
+            f"--exclude=.git "
+            f"--exclude=.env "
+            f"--exclude='*.log' "
+            f"-C . ."
+        )
+
+        exit_code, tar_out, tar_err = (
+            run_remote_command(
+                ssh1,
+                tar_cmd,
+                timeout=600
+            )
+        )
+
+        print(
+            "Tar output:"
+        )
+
+        print(tar_out)
+
+        if exit_code != 0:
+            raise Exception(
+                f"Tar creation failed: {tar_err}"
+            )
+
+        # ====================================================
+        # CONNECT TARGET
+        # ====================================================
+
+        print(
+            "\nConnecting to target:"
+        )
+
+        print(target_host)
+
+        ssh2 = paramiko.SSHClient()
+
+        ssh2.set_missing_host_key_policy(
+            paramiko.AutoAddPolicy()
+        )
+
+        ssh2.connect(
+            target_host,
+            username=target_user,
+            password=target_password,
+            timeout=30
+        )
+
+        # ====================================================
+        # DETECT DOCKER / PODMAN
+        # ====================================================
+
+        container_runtime = (
+            detect_container_runtime(ssh2)
+        )
+
+        if not container_runtime:
+            raise Exception(
+                "Neither Docker nor Podman is installed "
+                "or available on the destination."
+            )
+
+        print(
+            "\nContainer runtime:"
+        )
+
+        print(container_runtime)
+
+        # ====================================================
+        # TARGET PATHS
+        # ====================================================
+
+        target_extract_dir = (
+            f"/home/{target_user}/{pid}_app"
+        )
+
+        target_tar_path = (
+            f"/home/{target_user}/{pid}.tar"
+        )
+
+        containerfile_name = (
+            "Dockerfile"
+            if container_runtime == "docker"
+            else "Containerfile"
+        )
+
+        target_containerfile_path = os.path.join(
+            target_extract_dir,
+            containerfile_name
+        )
+
+        container_name = (
+            f"app-{pid}"
+        )
+
+        image_name = (
+            f"app-{pid}"
+        )
+
+        # ====================================================
+        # CREATE TARGET DIRECTORY
+        # ====================================================
+
+        exit_code, out, err = (
+            run_remote_command(
+                ssh2,
+                f"mkdir -p '{target_extract_dir}'"
+            )
+        )
+
+        if exit_code != 0:
+            raise Exception(
+                f"Unable to create target directory: {err}"
+            )
+
+        # ====================================================
+        # SFTP TRANSFER
+        # ====================================================
+
+        print(
+            "\nTransferring application to destination..."
+        )
+
+        sftp1 = ssh1.open_sftp()
+        sftp2 = ssh2.open_sftp()
+
+        # ----------------------------------------------------
+        # Transfer Containerfile
+        # ----------------------------------------------------
+
+        with sftp2.open(
+            target_containerfile_path,
+            "wb"
+        ) as destination_file:
+
+            destination_file.write(
+                dockerfile_content.encode("utf-8")
+            )
+
+        # ----------------------------------------------------
+        # Transfer tar
+        # ----------------------------------------------------
+
+        with sftp1.open(
+            tar_path,
+            "rb"
+        ) as source_file:
+
+            with sftp2.open(
+                target_tar_path,
+                "wb"
+            ) as destination_file:
+
+                shutil.copyfileobj(
+                    source_file,
+                    destination_file,
+                    length=16 * 1024 * 1024
+                )
+
+        sftp1.close()
+        sftp1 = None
+
+        sftp2.close()
+        sftp2 = None
+
+        # ====================================================
+        # EXTRACT APPLICATION
+        # ====================================================
+
+        print(
+            "\nExtracting application..."
+        )
+
+        extract_cmd = (
+            f"tar -xf '{target_tar_path}' "
+            f"-C '{target_extract_dir}'"
+        )
+
+        exit_code, out, err = (
+            run_remote_command(
+                ssh2,
+                extract_cmd,
+                timeout=600
+            )
+        )
+
+        if exit_code != 0:
+            raise Exception(
+                f"Application extraction failed: {err}"
+            )
+
+        # ====================================================
+        # REPLACE CONTAINERFILE AFTER EXTRACTION
+        # ====================================================
+
+        transfer_success, transfer_error = (
+            transfer_containerfile(
+                ssh2,
+                target_containerfile_path,
+                dockerfile_content
+            )
+        )
+
+        if not transfer_success:
+            raise Exception(
+                "Unable to place Containerfile after "
+                f"application extraction: {transfer_error}"
+            )
+
+        # ====================================================
+        # BUILD + RUN + REPAIR
+        # ====================================================
+
+        result = build_and_run_with_repair(
+            ssh=ssh2,
+            runtime=container_runtime,
+            container_name=container_name,
+            image_name=image_name,
+            target_extract_dir=target_extract_dir,
+            containerfile_content=dockerfile_content,
+            context=context,
+            max_attempts=MAX_CONTAINERIZATION_ATTEMPTS
+        )
+
+        # ====================================================
+        # SUCCESS
+        # ====================================================
+
+        if result.get("success"):
+
+            print(
+                "\nMigration completed successfully."
+            )
+
+            # Remove source temporary directory.
+            if source_temp_dir:
+                try:
+                    cleanup_remote_dir(
+                        ssh1,
+                        source_temp_dir
+                    )
+                except Exception as cleanup_error:
+                    print(
+                        "Source cleanup warning:",
+                        cleanup_error
+                    )
+
+            # Remove target tar only.
+            try:
+                cleanup_remote_dir(
+                    ssh2,
+                    target_tar_path
+                )
+            except Exception as cleanup_error:
+                print(
+                    "Target tar cleanup warning:",
+                    cleanup_error
+                )
 
             return jsonify({
-                "status": "success",
                 "message": (
-                    "Edited Containerfile successfully "
-                    "built and container is running."
+                    f"Non-container application {pid} "
+                    f"migrated successfully to container"
                 ),
-                "migration_id": migration_id,
-                "container_runtime": runtime,
                 "container_name": container_name,
                 "image_name": image_name,
-                "port": port,
-                "container_status": status,
-                "containerfile": edited_containerfile
+                "container_runtime": container_runtime,
+                "port": result.get("port"),
+                "run_command": result.get(
+                    "run_command"
+                ),
+                "attempts": result.get(
+                    "attempts"
+                ),
+                "containerfile": result.get(
+                    "containerfile"
+                ),
+                "containerfile_name": result.get(
+                    "containerfile_name",
+                    containerfile_name
+                ),
+                "requires_user_edit": False,
+                "can_retry_with_edited_file": False,
+                "application_transferred": True,
+                "status": "running",
+                "status_code": 200
             }), 200
 
-        # ----------------------------------------------------
-        # Container created but stopped
-        # ----------------------------------------------------
-
-        container_logs = ""
-
-        container_inspect = ""
-
-        if status["exists"]:
-
-            container_logs = get_container_logs(
-                target_ssh,
-                runtime,
-                container_name
-            )
-
-            container_inspect = get_container_inspect(
-                target_ssh,
-                runtime,
-                container_name
-            )
+        # ====================================================
+        # FAILURE AFTER 5 ATTEMPTS
+        # ====================================================
 
         return jsonify({
-            "status": "manual_retry_required",
             "message": (
-                "Edited Containerfile was built, "
-                "but the container is not running."
+                f"Unable to successfully run "
+                f"application {pid} in destination "
+                f"after {result.get('attempts', MAX_CONTAINERIZATION_ATTEMPTS)} "
+                f"attempts."
             ),
-            "migration_id": migration_id,
-            "container_runtime": runtime,
-            "container_name": container_name,
-            "image_name": image_name,
-            "port": port,
-            "containerfile": edited_containerfile,
-            "run_result": run_result,
-            "container_status": status,
-            "container_logs": container_logs,
-            "container_inspect": container_inspect,
-            "image_info": image_info
-        }), 200
+            "container_name": result.get(
+                "container_name",
+                container_name
+            ),
+            "image_name": result.get(
+                "image_name",
+                image_name
+            ),
+            "container_runtime": result.get(
+                "container_runtime",
+                container_runtime
+            ),
+            "port": result.get(
+                "port",
+                detected_port
+            ),
+            "attempts": result.get(
+                "attempts",
+                MAX_CONTAINERIZATION_ATTEMPTS
+            ),
+            "stage": result.get(
+                "stage"
+            ),
+            "failure_details": result.get(
+                "reason"
+            ),
+            "containerfile": result.get(
+                "containerfile",
+                dockerfile_content
+            ),
+            "containerfile_name": result.get(
+                "containerfile_name",
+                containerfile_name
+            ),
+            "requires_user_edit": True,
+            "can_retry_with_edited_file": True,
+            "application_transferred": True,
+            "status": 500
+        }), 500
 
-    except Exception as exc:
+    except Exception as e:
 
-        import traceback
-        traceback.print_exc()
+        print(
+            "\nMigration error:"
+        )
+
+        print(
+            str(e)
+        )
 
         return jsonify({
-            "status": "error",
-            "message": str(exc)
+            "error": str(e),
+            "status": 500
         }), 500
 
     finally:
 
-        if target_ssh:
-            target_ssh.close()
+        # ====================================================
+        # SFTP CLEANUP
+        # ====================================================
 
+        try:
+            if sftp1:
+                sftp1.close()
+        except Exception:
+            pass
 
-# ============================================================
-# OPTIONAL: CHECK MIGRATION STATUS
-# ============================================================
+        try:
+            if sftp2:
+                sftp2.close()
+        except Exception:
+            pass
 
-@app.route(
-    "/api/non-container-to-container-status/<migration_id>",
-    methods=["GET"]
-)
-def migration_status(migration_id):
+        # ====================================================
+        # SSH CLEANUP
+        # ====================================================
 
-    session = get_migration_session(
-        migration_id
-    )
+        try:
+            if ssh1:
+                ssh1.close()
+        except Exception:
+            pass
 
-    if not session:
-        return jsonify({
-            "status": "error",
-            "message": "Migration session not found"
-        }), 404
-
-    target_ssh = None
-
-    try:
-
-        target = session["target"]
-
-        target_ssh = connect_ssh(
-            host=target["ip"],
-            username=target["username"],
-            password=target.get("password"),
-            port=target.get("port", 22)
-        )
-
-        status = get_container_status(
-            target_ssh,
-            session["runtime"],
-            session["container_name"]
-        )
-
-        return jsonify({
-            "status": "success",
-            "migration_id": migration_id,
-            "container_runtime": session[
-                "runtime"
-            ],
-            "container_name": session[
-                "container_name"
-            ],
-            "image_name": session[
-                "image_name"
-            ],
-            "port": session[
-                "port"
-            ],
-            "container_status": status
-        })
-
-    except Exception as exc:
-
-        return jsonify({
-            "status": "error",
-            "message": str(exc)
-        }), 500
-
-    finally:
-
-        if target_ssh:
-            target_ssh.close()
-
-
-# ============================================================
-# RUN APPLICATION
-# ============================================================
-
-if __name__ == "__main__":
-
-    app.run(
-        host="0.0.0.0",
-        port=int(
-            os.environ.get(
-                "PORT",
-                1201
-            )
-        ),
-        debug=False
-    )
+        try:
+            if ssh2:
+                ssh2.close()
+        except Exception:
+            pass

@@ -1,0 +1,771 @@
+from flask import Blueprint, request, jsonify
+import os
+import re
+import json
+import requests
+import paramiko
+
+from db import load_config
+from migrate_non_container import run_remote_command
+
+
+# ============================================================
+# BLUEPRINT AND CONFIGURATION
+# ============================================================
+
+bp = Blueprint("prerequisite_validator", __name__)
+
+MAX_PREREQUISITE_ATTEMPTS = 5
+COMMAND_TIMEOUT = 30
+LLM_TIMEOUT = 120
+MAX_PREREQUISITES = 100
+
+
+# ============================================================
+# SAFE COMMAND VALIDATION
+# ============================================================
+
+# Only explicitly approved, read-only verification commands
+# are allowed. Add patterns here when supporting new tools.
+
+SAFE_COMMAND_PATTERNS = [
+    r"command -v [a-zA-Z0-9_.+-]+",
+    r"which [a-zA-Z0-9_.+-]+",
+
+    r"(?:python|python3|python3\.\d+)"
+    r" --version",
+
+    r"(?:pip|pip3|pip3\.\d+)"
+    r" --version",
+
+    r"(?:python|python3|python3\.\d+)"
+    r" -m pip --version",
+
+    r"(?:node|npm|npx|java|javac|podman|docker|"
+    r"git|curl|gcc|g\+\+|make|mvn|gradle)"
+    r" (?:--version|-version|-V)",
+]
+
+
+def is_safe_prerequisite_command(command):
+    """Accept only explicitly allowed verification commands."""
+
+    if not isinstance(command, str):
+        return False
+
+    command = command.strip()
+
+    if not command or len(command) > 200:
+        return False
+
+    if "\n" in command or "\r" in command:
+        return False
+
+    return any(
+        re.fullmatch(pattern, command)
+        for pattern in SAFE_COMMAND_PATTERNS
+    )
+
+
+# ============================================================
+# VERSION EXTRACTION AND COMPARISON
+# ============================================================
+
+def extract_version(output):
+    """Extract the first numeric version from command output."""
+
+    if not output:
+        return None
+
+    # Prefer multi-component versions such as 3.11.9 or 17.0.12.
+    match = re.search(
+        r"(?<![A-Za-z0-9])v?(\d+(?:\.\d+)+)",
+        output
+    )
+
+    if not match:
+        match = re.search(
+            r"(?<![A-Za-z0-9])v?(\d+)",
+            output
+        )
+
+    return match.group(1) if match else None
+
+
+def version_matches(actual, required):
+    """
+    Compare numeric version prefixes.
+
+    3.11.9 matches 3.11.
+    20.18.0 matches 20.
+    3.9.18 does not match 3.11.
+    """
+
+    if not actual or not required:
+        return False
+
+    try:
+        actual_parts = tuple(
+            int(part) for part in actual.split(".")
+        )
+
+        required_parts = tuple(
+            int(part) for part in str(required).split(".")
+        )
+
+        if len(actual_parts) < len(required_parts):
+            return False
+
+        return (
+            actual_parts[:len(required_parts)]
+            == required_parts
+        )
+
+    except (ValueError, AttributeError):
+        return False
+
+
+# ============================================================
+# LLM COMMAND GENERATION / REPAIR
+# ============================================================
+
+def call_llm_for_prerequisite_command(
+    prerequisite,
+    previous_attempt=None
+):
+    """
+    Generate an initial verification command or repair a failed
+    command using its execution evidence.
+
+    The generated command is still checked against the allowlist
+    before it can be executed.
+    """
+
+    cfg = load_config(
+        os.environ.get("environment") or "local"
+    )
+
+    model_name = cfg.get("model_name")
+    model_url = cfg.get("model_url")
+    api_key = os.environ.get("api_key")
+
+    if not model_name or not model_url or not api_key:
+        return {
+            "error": "LLM configuration is incomplete"
+        }
+
+    previous_attempt = previous_attempt or {}
+
+    prompt = f"""
+You are a Linux DevOps engineer validating prerequisites
+on a remote Linux VM.
+
+PREREQUISITE:
+{json.dumps(prerequisite, indent=2)}
+
+PREVIOUS ATTEMPT:
+{json.dumps(previous_attempt, indent=2)}
+
+TASK:
+Generate one command to verify the prerequisite.
+
+RULES:
+1. Return ONLY valid JSON.
+2. Do not use Markdown or code fences.
+3. Return exactly these keys: command, reason.
+4. The command must be read-only.
+5. Never install, uninstall, update or configure software.
+6. Never use sudo.
+7. Never modify files or environment variables.
+8. Never use pipes, semicolons, redirects, shell chaining,
+   command substitutions or arbitrary scripts.
+9. Do not use network commands or download anything.
+10. Prefer checking executable availability or its version.
+11. Consider alternative executable names when appropriate.
+12. If a previous attempt failed, use its output to choose
+    a different command.
+13. Do not repeat previously attempted commands.
+14. Respect required_version if one is specified.
+15. Do not assume that the latest version is required.
+16. Do not invent executable names.
+17. Use only a simple verification command, for example:
+    command -v python3
+    python3 --version
+    python3 -m pip --version
+    node --version
+    npm --version
+    java -version
+    podman --version
+
+Return:
+{{
+    "command": "python3 --version",
+    "reason": "Verify the installed Python version"
+}}
+"""
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Generate safe, read-only Linux prerequisite "
+                    "verification commands. Return valid JSON only."
+                )
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "temperature": 0
+    }
+
+    headers = {
+        "x-api-key": api_key,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.post(
+            model_url,
+            json=payload,
+            headers=headers,
+            timeout=LLM_TIMEOUT
+        )
+
+        response.raise_for_status()
+
+        content = (
+            response.json()["choices"][0]["message"]["content"]
+            .strip()
+        )
+
+        content = re.sub(
+            r"^```(?:json)?\s*|\s*```$",
+            "",
+            content,
+            flags=re.IGNORECASE
+        ).strip()
+
+        result = json.loads(content)
+
+        if not isinstance(result, dict):
+            raise ValueError("Expected a JSON object")
+
+        command = result.get("command")
+
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("LLM returned no verification command")
+
+        return {
+            "command": command.strip(),
+            "reason": str(result.get("reason", "Verification"))
+        }
+
+    except Exception as exc:
+        print("LLM prerequisite command error:", str(exc))
+
+        return {
+            "error": str(exc)
+        }
+
+
+# ============================================================
+# COMMAND EXECUTION
+# ============================================================
+
+def execute_prerequisite_command(ssh, command):
+    """
+    Execute a validated command on the remote VM.
+
+    No installation or configuration commands are allowed.
+    """
+
+    if not is_safe_prerequisite_command(command):
+        return {
+            "success": False,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "Command rejected by safety validation",
+            "command": command
+        }
+
+    try:
+        exit_code, stdout, stderr = run_remote_command(
+            ssh,
+            command,
+            timeout=COMMAND_TIMEOUT
+        )
+
+        return {
+            "success": exit_code == 0,
+            "exit_code": exit_code,
+            "stdout": stdout or "",
+            "stderr": stderr or "",
+            "command": command
+        }
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": str(exc),
+            "command": command
+        }
+
+
+# ============================================================
+# SINGLE PREREQUISITE VALIDATION WITH REPAIR
+# ============================================================
+
+def check_prerequisite_with_repair(
+    ssh,
+    prerequisite,
+    max_attempts=MAX_PREREQUISITE_ATTEMPTS
+):
+    """
+    Validate one prerequisite.
+
+    Retries with LLM-generated verification commands if required.
+    Does not install or modify anything.
+    """
+
+    name = prerequisite.get("name", "Unknown prerequisite")
+    required_version = prerequisite.get("required_version")
+
+    history = []
+    attempted_commands = set()
+    previous_attempt = {}
+    command = prerequisite.get("initial_command")
+
+    if not isinstance(name, str) or not name.strip():
+        return {
+            "name": "Unknown prerequisite",
+            "status": "unable_to_verify",
+            "reason": "A valid prerequisite name is required",
+            "attempts": 0,
+            "history": []
+        }
+
+    if not isinstance(max_attempts, int) or max_attempts < 1:
+        max_attempts = MAX_PREREQUISITE_ATTEMPTS
+
+    max_attempts = min(max_attempts, MAX_PREREQUISITE_ATTEMPTS)
+
+    if required_version is not None:
+        required_version = str(required_version).strip()
+
+        if (
+            not required_version
+            or not re.fullmatch(
+                r"\d+(?:\.\d+)*",
+                required_version
+            )
+        ):
+            return {
+                "name": name,
+                "status": "unable_to_verify",
+                "reason": "Invalid required_version format",
+                "attempts": 0,
+                "history": []
+            }
+
+    if command is not None and not isinstance(command, str):
+        return {
+            "name": name,
+            "status": "unable_to_verify",
+            "reason": "initial_command must be a string",
+            "attempts": 0,
+            "history": []
+        }
+
+    for attempt in range(1, max_attempts + 1):
+
+        # Generate an initial command if none was supplied,
+        # or generate a replacement after a failed attempt.
+        if not command:
+            generated = call_llm_for_prerequisite_command(
+                prerequisite,
+                previous_attempt
+            )
+
+            if generated.get("error"):
+                previous_attempt = {
+                    **previous_attempt,
+                    "llm_error": generated["error"]
+                }
+                break
+
+            command = generated["command"]
+
+        command = command.strip()
+
+        # Do not execute unsafe commands.
+        if not is_safe_prerequisite_command(command):
+            previous_attempt = {
+                "attempt": attempt,
+                "command": command,
+                "failure_reason": (
+                    "Command rejected by the safety allowlist"
+                )
+            }
+
+            history.append(previous_attempt.copy())
+            command = None
+            continue
+
+        # Avoid repeated commands.
+        if command in attempted_commands:
+            previous_attempt = {
+                "attempt": attempt,
+                "command": command,
+                "failure_reason": (
+                    "Command already attempted"
+                )
+            }
+
+            history.append(previous_attempt.copy())
+            command = None
+            continue
+
+        attempted_commands.add(command)
+
+        execution = execute_prerequisite_command(
+            ssh,
+            command
+        )
+
+        combined_output = "\n".join(
+            part for part in (
+                execution["stdout"],
+                execution["stderr"]
+            ) if part
+        ).strip()
+
+        detected_version = extract_version(combined_output)
+
+        entry = {
+            "attempt": attempt,
+            "command": command,
+            "reason": prerequisite.get("description", ""),
+            "exit_code": execution["exit_code"],
+            "stdout": execution["stdout"],
+            "stderr": execution["stderr"],
+            "detected_version": detected_version
+        }
+
+        history.append(entry)
+
+        # A successful version command must actually produce
+        # evidence of a version when one is required.
+        if execution["success"] and combined_output:
+
+            if required_version is not None:
+
+                if detected_version is None:
+                    previous_attempt = {
+                        **entry,
+                        "failure_reason": (
+                            "Command succeeded, but a version "
+                            "could not be identified"
+                        )
+                    }
+
+                elif version_matches(
+                    detected_version,
+                    required_version
+                ):
+                    return {
+                        "name": name,
+                        "status": "present",
+                        "required_version": required_version,
+                        "detected_version": detected_version,
+                        "verified_by": command,
+                        "attempts": attempt,
+                        "history": history
+                    }
+
+                else:
+                    previous_attempt = {
+                        **entry,
+                        "failure_reason": (
+                            "Installed version does not satisfy "
+                            "the required version"
+                        )
+                    }
+
+            else:
+                return {
+                    "name": name,
+                    "status": "present",
+                    "detected_version": detected_version,
+                    "verified_by": command,
+                    "attempts": attempt,
+                    "history": history
+                }
+
+        else:
+            previous_attempt = {
+                **entry,
+                "failure_reason": "Verification command failed"
+            }
+
+        # No further attempt is needed after the final try.
+        if attempt >= max_attempts:
+            break
+
+        generated = call_llm_for_prerequisite_command(
+            prerequisite,
+            previous_attempt
+        )
+
+        if generated.get("error"):
+            previous_attempt["llm_error"] = generated["error"]
+            break
+
+        command = generated.get("command")
+
+        if (
+            not isinstance(command, str)
+            or not command.strip()
+            or command.strip() in attempted_commands
+        ):
+            previous_attempt["failure_reason"] = (
+                "LLM did not provide a new verification command"
+            )
+            command = None
+
+    # ========================================================
+    # DETERMINE FINAL STATUS
+    # ========================================================
+
+    # Missing is reported only when an explicit executable lookup
+    # failed. A generic failed version command is not sufficient.
+    lookup_attempts = [
+        item for item in history
+        if item.get("command", "").startswith(
+            ("command -v ", "which ")
+        )
+    ]
+
+    definitive_missing = any(
+        item.get("exit_code") == 1
+        and not item.get("stdout", "").strip()
+        and not item.get("stderr", "").strip()
+        for item in lookup_attempts
+    )
+
+    incompatible = any(
+        item.get("detected_version")
+        and required_version is not None
+        and not version_matches(
+            item["detected_version"],
+            required_version
+        )
+        for item in history
+    )
+
+    if incompatible:
+        status = "incompatible"
+    elif definitive_missing:
+        status = "missing"
+    else:
+        status = "unable_to_verify"
+
+    return {
+        "name": name,
+        "status": status,
+        "required_version": required_version,
+        "attempts": len(history),
+        "last_failure": previous_attempt,
+        "history": history
+    }
+
+
+# ============================================================
+# VALIDATE ALL PREREQUISITES
+# ============================================================
+
+def validate_all_prerequisites(
+    ssh,
+    prerequisite_data
+):
+    prerequisites = prerequisite_data.get(
+        "prerequisites",
+        []
+    )
+
+    if not isinstance(prerequisites, list):
+        raise ValueError("prerequisites must be a list")
+
+    if len(prerequisites) > MAX_PREREQUISITES:
+        raise ValueError(
+            f"Maximum {MAX_PREREQUISITES} prerequisites allowed"
+        )
+
+    results = []
+
+    for prerequisite in prerequisites:
+
+        if not isinstance(prerequisite, dict):
+            results.append({
+                "name": "Unknown prerequisite",
+                "status": "unable_to_verify",
+                "reason": "Prerequisite must be a JSON object",
+                "attempts": 0,
+                "history": []
+            })
+            continue
+
+        result = check_prerequisite_with_repair(
+            ssh=ssh,
+            prerequisite=prerequisite
+        )
+
+        results.append(result)
+
+    summary = {
+        "total": len(results),
+        "present": sum(
+            item["status"] == "present"
+            for item in results
+        ),
+        "missing": sum(
+            item["status"] == "missing"
+            for item in results
+        ),
+        "incompatible": sum(
+            item["status"] == "incompatible"
+            for item in results
+        ),
+        "unable_to_verify": sum(
+            item["status"] == "unable_to_verify"
+            for item in results
+        )
+    }
+
+    return {
+        "summary": summary,
+        "results": results
+    }
+
+
+# ============================================================
+# FLASK API
+# ============================================================
+
+@bp.route(
+    "/api/validate-prerequisites",
+    methods=["POST"]
+)
+def validate_prerequisites_api():
+
+    ssh = None
+
+    try:
+        data = request.get_json(silent=True)
+
+        if not isinstance(data, dict):
+            return jsonify({
+                "error": "A JSON request body is required"
+            }), 400
+
+        target = data.get("target") or {}
+        prerequisite_data = data.get("prerequisite_data") or {}
+
+        if not isinstance(target, dict):
+            return jsonify({
+                "error": "target must be a JSON object"
+            }), 400
+
+        if not isinstance(prerequisite_data, dict):
+            return jsonify({
+                "error": "prerequisite_data must be a JSON object"
+            }), 400
+
+        if not target.get("ip"):
+            return jsonify({
+                "error": "Target IP is required"
+            }), 400
+
+        if not target.get("TargetUsername"):
+            return jsonify({
+                "error": "Target username is required"
+            }), 400
+
+        prerequisites = prerequisite_data.get("prerequisites")
+
+        if not isinstance(prerequisites, list):
+            return jsonify({
+                "error": (
+                    "prerequisite_data.prerequisites "
+                    "must be a list"
+                )
+            }), 400
+
+        if len(prerequisites) > MAX_PREREQUISITES:
+            return jsonify({
+                "error": (
+                    f"Maximum {MAX_PREREQUISITES} "
+                    "prerequisites allowed"
+                )
+            }), 400
+
+        # ====================================================
+        # CONNECT TO REMOTE VM
+        # ====================================================
+
+        ssh = paramiko.SSHClient()
+
+        # Validate host keys against known_hosts.
+        ssh.load_system_host_keys()
+        ssh.set_missing_host_key_policy(
+            paramiko.RejectPolicy()
+        )
+
+        ssh.connect(
+            hostname=target["ip"],
+            username=target["TargetUsername"],
+            password=target.get("TargetPassword"),
+            timeout=30,
+            banner_timeout=30,
+            auth_timeout=30
+        )
+
+        # ====================================================
+        # VALIDATE ONLY -- NO INSTALLATION
+        # ====================================================
+
+        result = validate_all_prerequisites(
+            ssh=ssh,
+            prerequisite_data=prerequisite_data
+        )
+
+        return jsonify({
+            "message": "Prerequisite validation completed",
+            "validation_only": True,
+            **result
+        }), 200
+
+    except ValueError as exc:
+        return jsonify({
+            "error": str(exc)
+        }), 400
+
+    except Exception as exc:
+        print("Prerequisite validation error:", str(exc))
+
+        return jsonify({
+            "error": "Prerequisite validation failed",
+            "details": str(exc)
+        }), 500
+
+    finally:
+        if ssh:
+            try:
+                ssh.close()
+            except Exception:
+                pass
